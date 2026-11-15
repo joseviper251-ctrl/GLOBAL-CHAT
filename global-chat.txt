@@ -1,0 +1,4639 @@
+--=============================================================
+--  NEBULA CHAT  v9.8.9
+--  · FIX (drag): the window teleported to the top on the first
+--    pixel of a drag. The grab math read only the position's
+--    .Offset, and a window parked on a 0.5/0.5 scale anchor has
+--    an offset of 0 — so the drag base was the corner, not the
+--    window. The grab point is now converted to layer space on
+--    press, and the delta is divided by the UI scale so the
+--    window tracks the cursor exactly at any zoom.
+--  · FIX (drag): the Y floor was recomputed from the window's
+--    own absolute position every frame, so each attempt to drag
+--    upward pushed it down another 44px. Bounds now come from
+--    the layer, which does not move.
+--  · FIX (drag): size is read from the target instead of the
+--    base constants, so a minimised window and the side windows
+--    all clamp correctly.
+--  · STABILITY: a failed publish no longer tears the link down.
+--    Publishing and receiving are separate concerns — a 429 on
+--    a send leaves every socket alone, and the link is only
+--    given up when nothing is connected either. The watchdog
+--    also stopped killing healthy idle lanes and checks the
+--    socket's own connected flag first, with a 96s idle floor.
+--  · Sockets reconnect themselves, per lane, with exponential
+--    backoff and jitter. Lanes holding a socket are skipped by
+--    the poll loop, which cuts requests hard.
+--  · LIVE ROSTER: presence beats every 8s carrying a name, and
+--    the count is pruned at 24s. The pill updates the instant
+--    anyone arrives or drops. Tap it for the live list.
+--  · JOIN NOTICE: a first-seen heartbeat flashes
+--    "<name> joined the live chat".
+--  · LINK: ONE pinned host, ntfy.envs.net, for everyone. No
+--    pool, no probe-and-pick, no rotating mid-session. The host
+--    is a literal below; nothing at load time can override it.
+--  · FIX: envs.net nests payloads one level deeper
+--    ({"message":"{...}","topic":"..."}), so every line from it
+--    arrived with no sender and no body. Inbound lines are
+--    unwrapped before the gate.
+--  · FIX: title-bar nav buttons restored (DMs -144,
+--    groups -116, profile -172). Soc.closeAll also closes the
+--    DM and group windows.
+--  · FIX: blank bubbles gated out of the live path AND the
+--    history loader. Drops counted in the debug strip.
+--  · RELAY SHARDING: 4 lanes, everyone reads all, writes to
+--    their own. Config and deletes go to every lane.
+--  · KEYS: Giphy beta key dc6zaTOxFJmzC banned (403) and
+--    removed; pool rotates on 403/429. Tenor discontinued,
+--    KLIPY stands in on the /v2 shape.
+--=============================================================
+
+local Players    = game:GetService("Players")
+local Tween      = game:GetService("TweenService")
+local UIS        = game:GetService("UserInputService")
+local Http       = game:GetService("HttpService")
+local Camera     = workspace.CurrentCamera
+local RunService = game:GetService("RunService")
+local AssetSvc   = game:GetService("AssetService")
+local TextSvc    = game:GetService("TextService")
+local plr        = Players.LocalPlayer
+local pg         = plr:WaitForChild("PlayerGui")
+local bit        = bit32 or bit
+
+local gui
+local conns, running = {}, true
+local function track(c) conns[#conns + 1] = c; return c end
+
+local function mk(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+local function tw(obj, time, props, style, dir)
+	local t = Tween:Create(obj, TweenInfo.new(time, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out), props)
+	t:Play()
+	return t
+end
+local function utf8Cut(s, maxBytes)
+	if #s <= maxBytes then return s end
+	local cut = maxBytes
+	while cut > 0 do
+		local b = string.byte(s, cut + 1)
+		if b and b >= 0x80 and b < 0xC0 then cut = cut - 1 else break end
+	end
+	return string.sub(s, 1, cut)
+end
+local function utf8chars(s)
+	local out, i = {}, 1
+	while i <= #s do
+		local b = string.byte(s, i)
+		local len = 1
+		if b >= 0xF0 then len = 4 elseif b >= 0xE0 then len = 3 elseif b >= 0xC0 then len = 2 end
+		out[#out + 1] = string.sub(s, i, i + len - 1)
+		i = i + len
+	end
+	return out
+end
+local function esc(s)
+	s = s:gsub("&", "&amp;")
+	s = s:gsub("<", "&lt;")
+	s = s:gsub(">", "&gt;")
+	return s
+end
+local function lc(s) return string.lower(s or "") end
+local function inList(t, v)
+	for i = 1, #t do if t[i] == v then return true end end
+	return false
+end
+
+local Engine, FS, Q, API, Net, Cfg, Mem, H, UI, V, Pan, T =
+	{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+local Soc, Link, Card, DM, Grp = {}, {}, {}, {}, {}
+
+-- presence lives up here so the title bar can read it while it
+-- is still being assembled; the relay block re-uses these fields
+Net.presence, Net.presenceN = {}, 1
+Net.sid = string.format("%d-%x", plr.UserId or 0, math.random(1, 0x7FFFFFFF))
+Net.presence[Net.sid] = { at = os.clock(), name = plr.Name }
+
+if _G.__NebulaChatCleanup then pcall(_G.__NebulaChatCleanup) end
+_G.__NebulaChatCleanup = function()
+	running = false
+	pcall(function()
+		if Net and Net.hostReady and Net.post then
+			Net.post({ sys = "bye", sid = Net.sid, u = plr.Name })
+		end
+	end)
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	conns = {}
+	if Net and Net.socks then
+		for _, s in pairs(Net.socks) do pcall(function() s:Close() end) end
+	end
+	if _G.__NebulaChatWS then pcall(function() _G.__NebulaChatWS:Close() end) end
+	_G.__NebulaChatWS = nil
+	if gui and gui.Parent then gui:Destroy() end
+	if _G.NebulaChat == gui then _G.NebulaChat = nil end
+	if _G.__NebulaChatSave then pcall(_G.__NebulaChatSave) end
+	if Soc.saveNow then pcall(Soc.saveNow) end
+end
+do
+	local old = pg:FindFirstChild("NebulaChat")
+	if old then old:Destroy() end
+end
+
+-- ╔══════════════════════════════════════════════════════════╗
+-- ║  UI SHELL                                                ║
+-- ╚══════════════════════════════════════════════════════════╝
+UI.C = {
+	A    = Color3.fromRGB(124, 58, 237),
+	BG   = Color3.fromRGB(12, 12, 20),
+	FG   = Color3.fromRGB(233, 233, 242),
+	DIM  = Color3.fromRGB(125, 125, 154),
+	OKC  = Color3.fromRGB(34, 211, 168),
+	BADC = Color3.fromRGB(244, 114, 114),
+	WARN = Color3.fromRGB(250, 204, 21),
+}
+UI.isTouch = UIS.TouchEnabled
+UI.TAP = UI.isTouch and 46 or 38
+UI.COLS = UI.isTouch and 3 or 4
+UI.BASE_W, UI.BASE_H = 540, 430
+UI.PANEL_H = UI.isTouch and 250 or 208
+UI.AVATAR, UI.AVGAP = 34, 8
+UI.ACT_W = 24
+UI.noticeTok = 0
+UI.rainbowLabels = {}
+UI.rainbowPhase = 0
+UI.avatarCache = { url = {}, uid = {} }
+UI.minimized = false
+
+function UI.laidOut(g, timeout)
+	local t0 = os.clock()
+	while g.AbsoluteSize.X < 4 do
+		if os.clock() - t0 > (timeout or 2) then break end
+		task.wait()
+	end
+	return g.AbsoluteSize.X
+end
+
+UI.EMOJI = {
+	smile="😄", joy="😂", rofl="🤣", heart="❤️", fire="🔥", thumbsup="👍", thumbsdown="👎",
+	clap="👏", wave="👋", pray="🙏", cry="😭", angry="😠", cool="😎", thinking="🤔",
+	shrug="🤷", eyes="👀", star="⭐", sparkles="✨", skull="💀", ghost="👻", alien="👽",
+	robot="🤖", party="🎉", gift="🎁", crown="👑", gem="💎", money="💰", rocket="🚀",
+	zap="⚡", boom="💥", sweat="😅", wink="😉", kiss="😘", hearteyes="😍", sleepy="😴",
+	nerd="🤓", clown="🤡", poop="💩", cat="🐱", dog="🐶", monkey="🐵", dragon="🐉",
+	unicorn="🦄", pizza="🍕", burger="🍔", coffee="☕", cake="🎂", sword="⚔️", game="🎮",
+	trophy="🏆", hundred="💯", check="✅", cross="❌", ok="👌", peace="✌️", muscle="💪",
+	brain="🧠", lmao="😆", salt="🧂",
+}
+UI.emojiList = {}
+for _, v in pairs(UI.EMOJI) do UI.emojiList[#UI.emojiList + 1] = v end
+table.sort(UI.emojiList)
+
+function UI.convert(s)
+	return (s:gsub(":(%w+):", function(k) return UI.EMOJI[string.lower(k)] or (":" .. k .. ":") end))
+end
+
+function UI.rainbow(s, phase)
+	phase = phase or 0
+	local chars = utf8chars(s)
+	local n = math.max(1, #chars)
+	local out = {}
+	for i = 1, #chars do
+		local ch = chars[i]
+		if ch == " " then
+			out[#out + 1] = ch
+		else
+			local c = Color3.fromHSV((phase + i / n) % 1, 0.85, 1)
+			out[#out + 1] = string.format('<font color="#%02X%02X%02X">%s</font>',
+				math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5), ch)
+		end
+	end
+	return table.concat(out)
+end
+
+-- cached avatars are applied inline; only a cold lookup spawns
+function UI.loadAvatar(imageLabel, uid, name)
+	local id = uid
+	if not id and name and #name > 0 then id = UI.avatarCache.uid[lc(name)] end
+	if id then
+		local url = UI.avatarCache.url[id]
+		if url then
+			imageLabel.Image = url
+			imageLabel.ImageTransparency = 0
+			return
+		end
+	end
+	task.spawn(function()
+		if not id and name and #name > 0 then
+			local key = lc(name)
+			id = UI.avatarCache.uid[key]
+			if not id then
+				local ok, r = pcall(function() return Players:GetUserIdFromNameAsync(name) end)
+				if ok and type(r) == "number" then id = r; UI.avatarCache.uid[key] = r end
+			end
+		end
+		if not id then return end
+		local url = UI.avatarCache.url[id]
+		if not url then
+			local ok, r = pcall(function()
+				return Players:GetUserThumbnailAsync(id, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+			end)
+			if ok and type(r) == "string" then url = r; UI.avatarCache.url[id] = r end
+		end
+		if url and imageLabel.Parent then
+			imageLabel.Image = url
+			tw(imageLabel, .3, { ImageTransparency = 0 })
+		end
+	end)
+end
+
+gui = mk("ScreenGui", { Name = "NebulaChat", ResetOnSpawn = false, IgnoreGuiInset = true,
+	DisplayOrder = 60, ZIndexBehavior = Enum.ZIndexBehavior.Sibling }, pg)
+
+UI.root = mk("Frame", { Name = "Main", AnchorPoint = Vector2.new(.5, .5), Position = UDim2.new(.5, 0, .5, 0),
+	Size = UDim2.fromOffset(UI.BASE_W, UI.BASE_H), BackgroundColor3 = UI.C.BG, BorderSizePixel = 0,
+	Active = true, ClipsDescendants = true, ZIndex = 1 }, gui)
+mk("UICorner", { CornerRadius = UDim.new(0, 16) }, UI.root)
+
+UI.layer = mk("Frame", { Name = "Layer", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+	ZIndex = 2 }, gui)
+UI.layerScale = mk("UIScale", { Scale = 1 }, UI.layer)
+
+UI.scale = mk("UIScale", { Scale = 1 }, UI.root)
+
+function UI.layerDims()
+	local s = math.max(0.35, UI.scale.Scale)
+	local vp = Camera.ViewportSize
+	return vp.X / s, vp.Y / s
+end
+
+function UI.clampRoot()
+	local vp = Camera.ViewportSize
+	local sz = UI.root.AbsoluteSize
+	local cx = UI.root.Position.X.Scale * vp.X + UI.root.Position.X.Offset
+	local cy = UI.root.Position.Y.Scale * vp.Y + UI.root.Position.Y.Offset
+	local hx, hy = sz.X / 2, sz.Y / 2
+	cx = math.clamp(cx, hx, math.max(hx, vp.X - hx))
+	cy = math.clamp(cy, hy, math.max(hy, vp.Y - hy))
+	UI.root.Position = UDim2.fromOffset(cx, cy)
+end
+
+function UI.clampFab()
+	local vp = Camera.ViewportSize
+	local half = UI.fab.AbsoluteSize.X / 2
+	local cx = math.max(half, vp.X - 30)
+	UI.fab.Position = UDim2.fromOffset(cx, vp.Y / 2)
+end
+
+function UI.clampWin(win, w, h)
+	local W, H = UI.layerDims()
+	local x = math.clamp(win.Position.X.Offset, 0, math.max(0, W - w))
+	local y = math.clamp(win.Position.Y.Offset, 0, math.max(0, H - h))
+	win.Position = UDim2.fromOffset(x, y)
+end
+
+-- dock beside the panel; top edge never rises above the title bar
+function UI.dockWin(win, w, h, minH)
+	local s = math.max(0.35, UI.scale.Scale)
+	local gap = 10
+	local W, H = UI.layerDims()
+
+	local ww = math.min(w, W - 12)
+	local hh = math.min(h, math.max(minH or 260, H - 12))
+	win.Size = UDim2.fromOffset(ww, hh)
+
+	local rp, rs = UI.root.AbsolutePosition, UI.root.AbsoluteSize
+	local maxX = math.max(0, W - ww)
+	local maxY = math.max(0, H - hh)
+
+	local topLine = rp.Y / s + 44
+	local y = math.clamp(topLine, 0, maxY)
+
+	local rightX = (rp.X + rs.X) / s + gap
+	local leftX = rp.X / s - gap - ww
+	local x
+	if rightX + ww <= W then
+		x = rightX
+	elseif leftX >= 0 then
+		x = leftX
+	else
+		x = maxX
+	end
+	win.Position = UDim2.fromOffset(math.clamp(x, 0, maxX), y)
+	return ww, hh
+end
+
+-- ── dragging ────────────────────────────────────────────────
+-- The old version read only Position.Offset. A window parked on
+-- a 0.5/0.5 scale anchor has offset 0, so the drag base was the
+-- corner and the first pixel of movement threw it to the top.
+-- The grab point is now frozen in layer space on press, the
+-- pointer delta is divided by the UI scale so the window tracks
+-- the cursor at any zoom, and the bounds come from the layer
+-- instead of the moving window (the old Y floor was derived from
+-- the window's own position, so dragging up pushed it down).
+function UI.makeDraggable(handle, target, w, h)
+	local on, base, grab, size = false, nil, nil, nil
+
+	local function stop()
+		on, base, grab, size = false, nil, nil, nil
+	end
+
+	handle.InputBegan:Connect(function(i)
+		if i.UserInputType ~= Enum.UserInputType.MouseButton1
+		and i.UserInputType ~= Enum.UserInputType.Touch then return end
+		local s = math.max(0.35, UI.scale.Scale)
+		local vp = Camera.ViewportSize
+		local p = target.Position
+		base = Vector2.new(p.X.Scale * vp.X / s + p.X.Offset,
+			p.Y.Scale * vp.Y / s + p.Y.Offset)
+		grab = Vector2.new(i.Position.X / s, i.Position.Y / s)
+		size = Vector2.new(target.AbsoluteSize.X / s, target.AbsoluteSize.Y / s)
+		if size.X < 4 or size.Y < 4 then size = Vector2.new(w or 320, h or 240) end
+		target.Position = UDim2.fromOffset(base.X, base.Y)
+		on = true
+	end)
+
+	track(UIS.InputChanged:Connect(function(i)
+		if not on or not base then return end
+		if i.UserInputType ~= Enum.UserInputType.MouseMovement
+		and i.UserInputType ~= Enum.UserInputType.Touch then return end
+		local s = math.max(0.35, UI.scale.Scale)
+		local W, H = UI.layerDims()
+		local dx = i.Position.X / s - grab.X
+		local dy = i.Position.Y / s - grab.Y
+		target.Position = UDim2.fromOffset(
+			math.clamp(base.X + dx, 0, math.max(0, W - size.X)),
+			math.clamp(base.Y + dy, 0, math.max(0, H - size.Y)))
+	end))
+
+	track(UIS.InputEnded:Connect(function(i)
+		if i.UserInputType ~= Enum.UserInputType.MouseButton1
+		and i.UserInputType ~= Enum.UserInputType.Touch then return end
+		stop()
+		if target == UI.root then UI.clampRoot() end
+	end))
+end
+
+function UI.fit()
+	local vp = Camera.ViewportSize
+	local s = math.clamp(math.min((vp.X - 24) / UI.BASE_W, (vp.Y - 90) / UI.BASE_H), 0.55, 1)
+	UI.scale.Scale = s
+	UI.layerScale.Scale = s
+	UI.layer.Size = UDim2.fromOffset(vp.X / s, vp.Y / s)
+	UI.clampRoot()
+	UI.clampFab()
+	if DM and DM.win and DM.win.Visible then UI.clampWin(DM.win, DM.W, DM.curH or DM.H) end
+	if Grp and Grp.win and Grp.win.Visible then UI.clampWin(Grp.win, Grp.W, Grp.curH or Grp.H) end
+	if Card and Card.frame and Card.frame.Visible then UI.clampWin(Card.frame, Card.W, Card.curH or Card.H) end
+	if Pan and Pan.gifsOpen then Pan.place() end
+end
+
+UI.cg = mk("CanvasGroup", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, GroupTransparency = 1 }, UI.root)
+
+UI.bar = mk("Frame", { Size = UDim2.new(1, 0, 0, 44), BackgroundColor3 = Color3.fromRGB(20, 20, 32),
+	BorderSizePixel = 0, Active = true, ZIndex = 3 }, UI.cg)
+mk("UICorner", { CornerRadius = UDim.new(0, 16) }, UI.bar)
+mk("TextLabel", { Size = UDim2.new(0, 104, 1, 0), Position = UDim2.new(0, 14, 0, 0), BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBlack, Text = "NEBULA CHAT", TextSize = 12, TextColor3 = UI.C.FG,
+	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 4 }, UI.bar)
+
+-- live presence pill: sits between the wordmark and the status line,
+-- and opens the live roster
+UI.livePill = mk("TextButton", { Size = UDim2.fromOffset(72, 18), Position = UDim2.new(0, 112, .5, 0),
+	AnchorPoint = Vector2.new(0, .5), BackgroundColor3 = Color3.fromRGB(26, 34, 31), BorderSizePixel = 0,
+	AutoButtonColor = false, Text = "", ZIndex = 4 }, UI.bar)
+mk("UICorner", { CornerRadius = UDim.new(1, 0) }, UI.livePill)
+UI.liveDot = mk("Frame", { Size = UDim2.fromOffset(6, 6), Position = UDim2.new(0, 7, .5, 0),
+	AnchorPoint = Vector2.new(0, .5), BackgroundColor3 = UI.C.DIM, BorderSizePixel = 0, ZIndex = 5 }, UI.livePill)
+mk("UICorner", { CornerRadius = UDim.new(1, 0) }, UI.liveDot)
+UI.liveCount = mk("TextLabel", { Size = UDim2.new(1, -18, 1, 0), Position = UDim2.fromOffset(17, 0),
+	BackgroundTransparency = 1, Font = Enum.Font.GothamBlack, Text = "1 LIVE", TextSize = 9,
+	TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5 }, UI.livePill)
+
+UI.livePanel = mk("Frame", { Size = UDim2.fromOffset(158, 176), Position = UDim2.fromOffset(112, 38),
+	BackgroundColor3 = Color3.fromRGB(18, 17, 30), BorderSizePixel = 0, Visible = false, ZIndex = 24 }, UI.cg)
+mk("UICorner", { CornerRadius = UDim.new(0, 12) }, UI.livePanel)
+mk("UIStroke", { Thickness = 1, Color = Color3.fromRGB(96, 86, 150), Transparency = .5 }, UI.livePanel)
+mk("UIPadding", { PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
+	PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, UI.livePanel)
+mk("TextLabel", { Size = UDim2.new(1, 0, 0, 12), BackgroundTransparency = 1, Font = Enum.Font.GothamBlack,
+	Text = "LIVE NOW", TextSize = 8.5, TextColor3 = Color3.fromRGB(216, 207, 251),
+	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 25 }, UI.livePanel)
+UI.liveScroll = mk("ScrollingFrame", { Size = UDim2.new(1, 0, 1, -16), Position = UDim2.fromOffset(0, 16),
+	BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 2,
+	ScrollBarImageColor3 = Color3.fromRGB(70, 70, 100), CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y, ZIndex = 25 }, UI.livePanel)
+UI.liveList = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1,
+	AutomaticSize = Enum.AutomaticSize.Y, ZIndex = 25 }, UI.liveScroll)
+mk("UIListLayout", { Padding = UDim.new(0, 3) }, UI.liveList)
+
+UI.status = mk("TextLabel", { Size = UDim2.new(0, 148, 1, 0), Position = UDim2.new(0, 192, 0, 0), BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham, Text = "loading...", TextSize = 10, TextColor3 = UI.C.DIM,
+	TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 4 }, UI.bar)
+
+function UI.ctrl(txt, x)
+	local b = mk("TextButton", { Size = UDim2.fromOffset(24, 24), Position = UDim2.new(1, x, 0, 10),
+		BackgroundColor3 = Color3.fromRGB(38, 38, 56), BorderSizePixel = 0, AutoButtonColor = false,
+		Font = Enum.Font.GothamBold, Text = txt, TextSize = 13, TextColor3 = UI.C.DIM, ZIndex = 4 }, UI.bar)
+	mk("UICorner", { CornerRadius = UDim.new(0, 7) }, b)
+	return b
+end
+UI.minB, UI.clsB = UI.ctrl("–", -60), UI.ctrl("×", -32)
+
+UI.notice = mk("TextLabel", { Size = UDim2.new(1, -24, 0, 18), Position = UDim2.new(0, 12, 0, 50),
+	BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "", TextSize = 10.5,
+	TextColor3 = UI.C.BADC, TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 25, TextTransparency = 1 }, UI.cg)
+
+function H.flash(msg, color)
+	UI.noticeTok = UI.noticeTok + 1
+	local tok = UI.noticeTok
+	UI.notice.Text = msg
+	UI.notice.TextColor3 = color or UI.C.BADC
+	UI.notice.TextTransparency = 0
+	task.delay(1.6, function()
+		if tok ~= UI.noticeTok then return end
+		tw(UI.notice, .4, { TextTransparency = 1 })
+	end)
+end
+
+function H.status()
+	if Net.live then
+		UI.status.Text = "live ● " .. Net.gameName .. (Cfg.slow > 0 and ("  ·  slow " .. Cfg.slow .. "s") or "")
+		UI.status.TextColor3 = UI.C.OKC
+	elseif Net.online then
+		UI.status.Text = "online · " .. Net.gameName .. (Cfg.slow > 0 and ("  ·  slow " .. Cfg.slow .. "s") or "")
+		UI.status.TextColor3 = UI.C.DIM
+	else
+		UI.status.Text = "reconnecting..."
+		UI.status.TextColor3 = UI.C.BADC
+	end
+end
+
+-- live roster: reads straight off the presence table, so the pill
+-- and the panel are always the same instant
+function H.liveRefresh()
+	if not UI.livePanel.Visible then return end
+	UI.liveList:ClearAllChildren()
+	mk("UIListLayout", { Padding = UDim.new(0, 3) }, UI.liveList)
+	local list = Net.liveList and Net.liveList() or {}
+	if #list == 0 then
+		mk("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+			Text = "just you", TextSize = 9, TextColor3 = UI.C.DIM,
+			TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 26 }, UI.liveList)
+		return
+	end
+	local shown = 0
+	for _, rec in ipairs(list) do
+		shown = shown + 1
+		if shown > 30 then break end
+		local row = mk("Frame", { Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1, ZIndex = 26 }, UI.liveList)
+		local av = mk("ImageLabel", { Size = UDim2.fromOffset(16, 16), Position = UDim2.fromOffset(0, 2),
+			BackgroundColor3 = Color3.fromRGB(45, 42, 66), BorderSizePixel = 0, Image = "",
+			ImageTransparency = 1, ZIndex = 27 }, row)
+		mk("UICorner", { CornerRadius = UDim.new(1, 0) }, av)
+		UI.loadAvatar(av, nil, rec.n)
+		mk("TextLabel", { Size = UDim2.new(1, -22, 1, 0), Position = UDim2.fromOffset(22, 0),
+			BackgroundTransparency = 1, Font = Enum.Font.GothamBold,
+			Text = rec.n .. (rec.sid == Net.sid and " (you)" or ""), TextSize = 9.5,
+			TextColor3 = rec.sid == Net.sid and UI.C.OKC or UI.C.FG,
+			TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+			ZIndex = 27 }, row)
+	end
+end
+
+function H.presence()
+	local n = 0
+	if Net.liveList then
+		n = #Net.liveList()
+	else
+		for _ in pairs(Net.presence) do n = n + 1 end
+	end
+	n = math.max(1, n)
+	UI.liveCount.Text = n .. " LIVE"
+	local col = n > 1 and UI.C.OKC or UI.C.DIM
+	UI.liveCount.TextColor3 = col
+	UI.liveDot.BackgroundColor3 = col
+	UI.livePill.BackgroundColor3 = n > 1 and Color3.fromRGB(26, 34, 31) or Color3.fromRGB(28, 28, 40)
+	H.liveRefresh()
+end
+
+function H.joined(name)
+	H.flash(name .. " joined the live chat", UI.C.OKC)
+end
+
+function H.closeLivePanel()
+	UI.livePanel.Visible = false
+end
+
+UI.livePill.MouseButton1Click:Connect(function()
+	if UI.livePanel.Visible then
+		H.closeLivePanel()
+	else
+		UI.livePanel.Visible = true
+		H.liveRefresh()
+	end
+end)
+
+UI.INBAR_H = UI.TAP + 16
+UI.REPLY_H = 40
+
+UI.chat = mk("ScrollingFrame", { Size = UDim2.new(1, 0, 1, -(44 + UI.INBAR_H)), Position = UDim2.new(0, 0, 0, 44),
+	BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+	ScrollBarImageColor3 = Color3.fromRGB(70, 70, 100),
+	CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ZIndex = 3 }, UI.cg)
+
+UI.holder = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1,
+	AutomaticSize = Enum.AutomaticSize.Y }, UI.chat)
+mk("UIListLayout", { Padding = UDim.new(0, 8) }, UI.holder)
+mk("UIPadding", { PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10),
+	PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14) }, UI.holder)
+
+-- rainbow loop idles while the window is hidden or minimised
+task.spawn(function()
+	while running and gui.Parent do
+		if UI.root.Visible and not UI.minimized and #UI.rainbowLabels > 0 then
+			UI.rainbowPhase = (UI.rainbowPhase + 0.015) % 1
+			for i = #UI.rainbowLabels, 1, -1 do
+				local r = UI.rainbowLabels[i]
+				if not r.label.Parent then
+					table.remove(UI.rainbowLabels, i)
+				else
+					r.label.Text = UI.rainbow(r.text, UI.rainbowPhase + r.phase)
+				end
+			end
+		end
+		task.wait(0.12)
+	end
+end)
+
+UI.replyBar = mk("Frame", { Size = UDim2.new(1, -20, 0, 30), Position = UDim2.new(0, 10, 1, -(UI.INBAR_H + 36)),
+	BackgroundColor3 = Color3.fromRGB(24, 23, 38), BorderSizePixel = 0, Visible = false, ZIndex = 6 }, UI.cg)
+mk("UICorner", { CornerRadius = UDim.new(0, 9) }, UI.replyBar)
+mk("Frame", { Size = UDim2.fromOffset(3, 18), Position = UDim2.new(0, 8, .5, 0), AnchorPoint = Vector2.new(0, .5),
+	BackgroundColor3 = UI.C.A, BorderSizePixel = 0, ZIndex = 7 }, UI.replyBar)
+UI.replyName = mk("TextLabel", { Size = UDim2.new(1, -70, 0, 11), Position = UDim2.fromOffset(18, 5),
+	BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "", TextSize = 9,
+	TextColor3 = Color3.fromRGB(216, 207, 251), TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 7 }, UI.replyBar)
+UI.replyText = mk("TextLabel", { Size = UDim2.new(1, -70, 0, 11), Position = UDim2.fromOffset(18, 16),
+	BackgroundTransparency = 1, Font = Enum.Font.Gotham, Text = "", TextSize = 9.5,
+	TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 7 }, UI.replyBar)
+UI.replyX = mk("TextButton", { Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, -26, .5, 0),
+	AnchorPoint = Vector2.new(0, .5), BackgroundColor3 = Color3.fromRGB(40, 38, 58), BorderSizePixel = 0,
+	AutoButtonColor = false, Font = Enum.Font.GothamBold, Text = "×", TextSize = 12,
+	TextColor3 = UI.C.DIM, ZIndex = 7 }, UI.replyBar)
+mk("UICorner", { CornerRadius = UDim.new(0, 7) }, UI.replyX)
+
+function UI.setReply(on)
+	UI.replyBar.Visible = on
+	UI.chat.Size = UDim2.new(1, 0, 1, -(44 + UI.INBAR_H + (on and UI.REPLY_H or 0)))
+	if on then V.scroll(false) end
+end
+
+UI.inbar = mk("Frame", { Size = UDim2.new(1, 0, 0, UI.INBAR_H), Position = UDim2.new(0, 0, 1, -UI.INBAR_H),
+	BackgroundColor3 = Color3.fromRGB(255, 255, 255), BackgroundTransparency = .975, BorderSizePixel = 0, ZIndex = 3 }, UI.cg)
+mk("UIPadding", { PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, UI.inbar)
+mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 7), VerticalAlignment = Enum.VerticalAlignment.Center }, UI.inbar)
+
+function UI.iconBtn(txt, ord, ts, parent)
+	local b = mk("TextButton", { Size = UDim2.fromOffset(UI.TAP, UI.TAP), BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+		BackgroundTransparency = .95, BorderSizePixel = 0, AutoButtonColor = false,
+		Font = Enum.Font.GothamBlack, Text = txt, TextSize = ts,
+		TextColor3 = Color3.fromRGB(201, 196, 224), LayoutOrder = ord, ZIndex = 4 }, parent or UI.inbar)
+	mk("UICorner", { CornerRadius = UDim.new(0, 11) }, b)
+	return b
+end
+UI.gifBtn, UI.emoBtn = UI.iconBtn("GIF", 1, 10), UI.iconBtn("🙂", 2, 15)
+
+UI.box = mk("TextBox", { Size = UDim2.new(1, -(UI.TAP * 2 + 90), 0, UI.TAP), BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+	BackgroundTransparency = .95, BorderSizePixel = 0, Font = Enum.Font.Gotham, Text = "",
+	PlaceholderText = "message everyone...", PlaceholderColor3 = Color3.fromRGB(110, 110, 138),
+	TextSize = 12, TextColor3 = UI.C.FG, TextXAlignment = Enum.TextXAlignment.Left,
+	ClearTextOnFocus = false, LayoutOrder = 3, ZIndex = 4 }, UI.inbar)
+mk("UICorner", { CornerRadius = UDim.new(0, 11) }, UI.box)
+mk("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }, UI.box)
+
+UI.send = mk("TextButton", { Size = UDim2.fromOffset(76, UI.TAP), BackgroundColor3 = UI.C.A, BorderSizePixel = 0,
+	AutoButtonColor = false, Font = Enum.Font.GothamBlack, Text = "SEND", TextSize = 11,
+	TextColor3 = Color3.new(1, 1, 1), LayoutOrder = 4, ZIndex = 4 }, UI.inbar)
+mk("UICorner", { CornerRadius = UDim.new(0, 11) }, UI.send)
+
+UI.panel = mk("Frame", { Size = UDim2.new(1, -20, 0, UI.PANEL_H), Position = UDim2.new(0, 10, 1, -(UI.INBAR_H + 8)),
+	AnchorPoint = Vector2.new(0, 1), BackgroundColor3 = Color3.fromRGB(18, 17, 30), BackgroundTransparency = 1,
+	BorderSizePixel = 0, Visible = false, ClipsDescendants = true, ZIndex = 60 }, UI.cg)
+mk("UICorner", { CornerRadius = UDim.new(0, 14) }, UI.panel)
+mk("UIPadding", { PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10), PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, UI.panel)
+
+UI.pTabs = mk("Frame", { Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1, ZIndex = 61 }, UI.panel)
+mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6) }, UI.pTabs)
+UI.pContent = mk("Frame", { Size = UDim2.new(1, 0, 1, -36), Position = UDim2.fromOffset(0, 36), BackgroundTransparency = 1, ZIndex = 61 }, UI.panel)
+
+UI.fab = mk("TextButton", { AnchorPoint = Vector2.new(.5, .5), Position = UDim2.new(1, -30, .5, 0),
+	Size = UDim2.fromOffset(50, 50), BackgroundColor3 = UI.C.A, BorderSizePixel = 0, AutoButtonColor = false,
+	Font = Enum.Font.Gotham, Text = "💬", TextSize = 22, TextColor3 = Color3.new(1, 1, 1), ZIndex = 25 }, gui)
+mk("UICorner", { CornerRadius = UDim.new(1, 0) }, UI.fab)
+
+-- chrome is bound here, right after the shell, so nothing that
+-- runs later can leave the window unclosable or stuck
+UI.fab.Visible = true
+
+UI.fab.MouseButton1Click:Connect(function()
+	if UI.root.Visible then
+		Soc.closeAll()
+		H.closeLivePanel()
+		UI.layer.Visible = false
+		tw(UI.cg, .25, { GroupTransparency = 1 })
+		task.delay(.26, function() UI.root.Visible = false end)
+	else
+		UI.minimized = false
+		UI.root.Visible = true
+		UI.root.Size = UDim2.fromOffset(UI.BASE_W, UI.BASE_H)
+		UI.chat.Visible = true
+		UI.inbar.Visible = true
+		UI.layer.Visible = true
+		if T.replyTo then UI.replyBar.Visible = true end
+		UI.clampRoot()
+		tw(UI.cg, .3, { GroupTransparency = 0 })
+	end
+end)
+
+UI.minB.MouseButton1Click:Connect(function()
+	UI.minimized = not UI.minimized
+	H.closeLivePanel()
+	if UI.minimized then
+		Pan.close(); Pan.closeOwner(); Soc.closeAll()
+		UI.layer.Visible = false
+		tw(UI.root, .3, { Size = UDim2.fromOffset(UI.BASE_W, 44) })
+		task.delay(.32, function()
+			if UI.minimized then
+				UI.chat.Visible = false
+				UI.inbar.Visible = false
+				UI.replyBar.Visible = false
+				UI.clampRoot()
+			end
+		end)
+	else
+		UI.chat.Visible = true
+		UI.inbar.Visible = true
+		UI.layer.Visible = true
+		if T.replyTo then UI.replyBar.Visible = true end
+		tw(UI.root, .35, { Size = UDim2.fromOffset(UI.BASE_W, UI.BASE_H) }, Enum.EasingStyle.Back)
+		task.delay(.36, UI.clampRoot)
+	end
+end)
+
+UI.clsB.MouseButton1Click:Connect(function()
+	if _G.__NebulaChatCleanup then pcall(_G.__NebulaChatCleanup) end
+end)
+
+UI.makeDraggable(UI.bar, UI.root, UI.BASE_W, UI.BASE_H)
+
+track(UIS.InputChanged:Connect(function(i)
+	if i.UserInputType ~= Enum.UserInputType.MouseWheel then return end
+	local over = UIS:GetMouseLocation()
+	local p = UI.root.AbsolutePosition
+	local s = UI.root.AbsoluteSize
+	if over.X >= p.X and over.X <= p.X + s.X and over.Y >= p.Y and over.Y <= p.Y + s.Y then
+		UI.chat.CanvasPosition = Vector2.new(0, math.max(0, UI.chat.CanvasPosition.Y - i.Position.Z * 60))
+	end
+end))
+
+track(Camera:GetPropertyChangedSignal("ViewportSize"):Connect(UI.fit))
+
+UI.root.Size = UDim2.fromOffset(UI.BASE_W - 60, UI.BASE_H - 40)
+tw(UI.root, .65, { Size = UDim2.fromOffset(UI.BASE_W, UI.BASE_H) }, Enum.EasingStyle.Back)
+tw(UI.cg, .5, { GroupTransparency = 0 })
+UI.status.Text = "connecting..."
+H.presence()
+UI.fit()
+
+task.wait()
+
+-- ╔══════════════════════════════════════════════════════════╗
+-- ║  GIF ENGINE                                              ║
+-- ╚══════════════════════════════════════════════════════════╝
+Engine.MAX_DIM    = 1024   -- sprite-sheet pixel budget
+Engine.MAX_FRAMES = 10
+Engine.CHAT_CAP   = 200    -- decode cap for chat bubbles
+Engine.TILE_CAP   = 112    -- decode cap for search tiles
+Engine.STEP       = 8      -- ms of work per yield in the decoder
+Engine.ZERO4      = string.char(0, 0, 0, 0)
+
+Engine.bxok = false
+if bit and type(bit.bxor) == "function" then
+	local ok = true
+	for _, v in ipairs({
+		{ 0x00000000, 0x00000000, 0x00000000 },
+		{ 0x000000FF, 0x0000000F, 0x000000F0 },
+		{ 0x0000FFFF, 0x12345678, 0x1234A987 },
+		{ 0xFFFFFFFF, 0x12345678, 0xEDCBA987 },
+		{ 0xDEADBEEF, 0xCAFEBABE, 0x14530451 },
+	}) do
+		local pok, r = pcall(bit.bxor, v[1], v[2])
+		if not pok or type(r) ~= "number" or (math.floor(r) % 4294967296) ~= v[3] then ok = false; break end
+	end
+	Engine.bxok = ok
+end
+
+function Engine.xor(a, b)
+	a = math.floor(a) % 4294967296
+	b = math.floor(b) % 4294967296
+	if Engine.bxok then
+		local r = bit.bxor(a, b)
+		if type(r) == "number" then return math.floor(r) % 4294967296 end
+	end
+	local r, p = 0, 1
+	while a > 0 or b > 0 do
+		if a % 2 ~= b % 2 then r = r + p end
+		a, b, p = math.floor(a / 2), math.floor(b / 2), p * 2
+	end
+	return r
+end
+
+function Engine.u32(n)
+	n = math.floor(n) % 4294967296
+	return string.char(math.floor(n / 16777216) % 256, math.floor(n / 65536) % 256,
+		math.floor(n / 256) % 256, n % 256)
+end
+
+function Engine.crcTable()
+	local tab = {}
+	for i = 0, 255 do
+		local c = i
+		for _ = 1, 8 do
+			if c % 2 == 1 then c = Engine.xor(0xEDB88320, math.floor(c / 2)) else c = math.floor(c / 2) end
+		end
+		tab[i] = c
+	end
+	return tab
+end
+Engine.CRC = Engine.crcTable()
+
+-- inlined table CRC; no per-byte function call when bit32 exists
+function Engine.crc32(s, tick)
+	local tab, c, guard, n = Engine.CRC, 4294967295, 0, #s
+	if Engine.bxok then
+		local bx = bit.bxor
+		for i = 1, n do
+			c = bx(math.floor(c / 256), tab[bx(c % 256, string.byte(s, i)) % 256])
+			guard = guard + 1
+			if guard >= 16384 then guard = 0; if tick then tick() end end
+		end
+	else
+		for i = 1, n do
+			c = Engine.xor(math.floor(c / 256), tab[Engine.xor(c % 256, string.byte(s, i)) % 256])
+			guard = guard + 1
+			if guard >= 4096 then guard = 0; if tick then tick() end end
+		end
+	end
+	return Engine.xor(c, 4294967295)
+end
+
+function Engine.adler32(s, tick)
+	local a, b, n, i, guard = 1, 0, #s, 1, 0
+	while i <= n do
+		local stop = math.min(i + 8191, n)
+		for j = i, stop do a = a + string.byte(s, j); b = b + a end
+		a, b = a % 65521, b % 65521
+		i = stop + 1
+		guard = guard + 1
+		if tick and guard % 8 == 0 then tick() end
+	end
+	return b * 65536 + a
+end
+
+function Engine.chunk(typ, data, tick)
+	return Engine.u32(#data) .. typ .. data .. Engine.u32(Engine.crc32(typ .. data, tick))
+end
+
+function Engine.png(w, h, raw, tick)
+	local z, n, i = "\120\001", #raw, 1
+	while i <= n do
+		local stop = math.min(i + 65534, n)
+		local len = stop - i + 1
+		local inv = 65535 - len
+		z = z .. string.char(stop >= n and 1 or 0)
+			.. string.char(len % 256, math.floor(len / 256) % 256)
+			.. string.char(inv % 256, math.floor(inv / 256) % 256)
+			.. string.sub(raw, i, stop)
+		i = stop + 1
+		if tick then tick() end
+	end
+	z = z .. Engine.u32(Engine.adler32(raw, tick))
+	local ihdr = Engine.u32(w) .. Engine.u32(h) .. string.char(8, 6, 0, 0, 0)
+	return "\137PNG\r\n\26\n" .. Engine.chunk("IHDR", ihdr, tick)
+		.. Engine.chunk("IDAT", z, tick) .. Engine.chunk("IEND", "", tick)
+end
+
+function Engine.ticker(budgetMs)
+	local t0 = os.clock()
+	return function()
+		if (os.clock() - t0) * 1000 >= budgetMs then
+			task.wait()
+			t0 = os.clock()
+		end
+	end
+end
+
+function Engine.lzw(data, minCode, expected, tick)
+	local clearCode = math.floor(2 ^ minCode)
+	local eoiCode = clearCode + 1
+	local dict, nextCode, codeSize
+	local function reset()
+		dict = {}
+		for i = 0, clearCode - 1 do dict[i] = string.char(i) end
+		nextCode, codeSize = eoiCode + 1, minCode + 1
+	end
+	reset()
+
+	local out, bitPos, total, prev, guard, produced = {}, 0, #data * 8, nil, 0, 0
+	while bitPos + codeSize <= total do
+		local bp = math.floor(bitPos / 8) + 1
+		local b1 = string.byte(data, bp) or 0
+		local b2 = string.byte(data, bp + 1) or 0
+		local b3 = string.byte(data, bp + 2) or 0
+		local w = b1 + b2 * 256 + b3 * 65536
+		local code = math.floor(math.floor(w / (2 ^ (bitPos % 8))) % (2 ^ codeSize))
+		bitPos = bitPos + codeSize
+
+		if code == clearCode then
+			reset(); prev = nil
+		elseif code == eoiCode then
+			break
+		else
+			local entry
+			if dict[code] then entry = dict[code]
+			elseif prev then entry = prev .. string.sub(prev, 1, 1) end
+			if entry then
+				out[#out + 1] = entry
+				produced = produced + #entry
+				if prev then
+					dict[nextCode] = prev .. string.sub(entry, 1, 1)
+					nextCode = nextCode + 1
+					if nextCode == math.floor(2 ^ codeSize) and codeSize < 12 then codeSize = codeSize + 1 end
+				end
+				prev = entry
+			end
+		end
+
+		guard = guard + 1
+		if tick and guard >= 2048 then guard = 0; tick() end
+		if expected and produced >= expected then break end
+	end
+	return table.concat(out)
+end
+
+function Engine.interlace(h)
+	local rows = {}
+	local function pass(start, step)
+		local y = start
+		while y < h do rows[#rows + 1] = y; y = y + step end
+	end
+	pass(0, 8); pass(4, 8); pass(2, 4); pass(1, 2)
+	return rows
+end
+
+function Engine.frameCount(data)
+	local pos = 14
+	local packed = string.byte(data, 11) or 0
+	if packed >= 128 then pos = pos + 3 * math.floor(2 ^ (packed % 8 + 1)) end
+	local n = 0
+	local function skipSub(p)
+		while true do
+			local len = string.byte(data, p)
+			if not len then return p end
+			p = p + 1
+			if len == 0 then return p end
+			p = p + len
+		end
+	end
+	while pos <= #data do
+		local m = string.byte(data, pos); pos = pos + 1
+		if m == 0x3B then break
+		elseif m == 0x21 then
+			pos = skipSub(pos + 1)
+		elseif m == 0x2C then
+			n = n + 1
+			local p2 = string.byte(data, pos + 8) or 0
+			pos = pos + 9
+			if p2 >= 128 then pos = pos + 3 * math.floor(2 ^ (p2 % 8 + 1)) end
+			pos = skipSub(pos + 1)
+		else
+			break
+		end
+	end
+	return n
+end
+
+-- cap = longest side of the decoded canvas; larger GIFs are
+-- decimated on a fixed pixel grid so tiles never decode at full size
+function Engine.decode(data, tick, cap)
+	if type(data) ~= "string" or string.sub(data, 1, 3) ~= "GIF" then return nil end
+	local pos = 7
+	local sw = string.byte(data, pos) + string.byte(data, pos + 1) * 256
+	local sh = string.byte(data, pos + 2) + string.byte(data, pos + 3) * 256
+	local packed = string.byte(data, pos + 4)
+	pos = pos + 7
+	if sw == 0 or sh == 0 or sw > 800 or sh > 800 then return nil end
+
+	local capv = cap or Engine.MAX_DIM
+	if capv < 32 then capv = 32 end
+	local step = 1
+	if sw > capv or sh > capv then
+		step = math.max(1, math.ceil(math.max(sw, sh) / capv))
+	end
+	local dw = math.max(1, math.ceil(sw / step))
+	local dh = math.max(1, math.ceil(sh / step))
+
+	local gct
+	if packed >= 128 then
+		local n = math.floor(2 ^ (packed % 8 + 1))
+		gct = {}
+		for i = 0, n - 1 do
+			gct[i] = string.char(string.byte(data, pos), string.byte(data, pos + 1), string.byte(data, pos + 2), 255)
+			pos = pos + 3
+		end
+	end
+
+	local total = 0
+	pcall(function() total = Engine.frameCount(data) end)
+	local stride = 1
+	if total > Engine.MAX_FRAMES then stride = math.ceil(total / Engine.MAX_FRAMES) end
+	local index = 0
+
+	local Z4 = Engine.ZERO4
+	local cells = dw * dh
+	local canvas = table.create(cells)
+	for i = 1, cells do canvas[i] = Z4 end
+
+	local frames, delays = {}, {}
+	local disposal, prevDisposal, prevRect, snapshot = 0, 0, nil, nil
+	local transFlag, transIndex, delayCs = false, nil, 10
+
+	local function skipSub(p)
+		while true do
+			local len = string.byte(data, p)
+			if not len then return p end
+			p = p + 1
+			if len == 0 then return p end
+			p = p + len
+		end
+	end
+
+	while pos <= #data do
+		local marker = string.byte(data, pos); pos = pos + 1
+		if marker == 0x3B then break
+
+		elseif marker == 0x21 then
+			local label = string.byte(data, pos); pos = pos + 1
+			if label == 0xF9 then
+				local p = string.byte(data, pos) or 0
+				if p >= 4 then
+					local p0 = string.byte(data, pos + 1) or 0
+					disposal = math.floor(p0 / 4) % 8
+					transFlag = p0 % 2 == 1
+					delayCs = (string.byte(data, pos + 2) or 0) + (string.byte(data, pos + 3) or 0) * 256
+					transIndex = string.byte(data, pos + 4)
+				end
+				pos = skipSub(pos + 1 + p)
+			else
+				pos = skipSub(pos)
+			end
+
+		elseif marker == 0x2C then
+			local left = string.byte(data, pos) + string.byte(data, pos + 1) * 256
+			local top  = string.byte(data, pos + 2) + string.byte(data, pos + 3) * 256
+			local fw   = string.byte(data, pos + 4) + string.byte(data, pos + 5) * 256
+			local fh   = string.byte(data, pos + 6) + string.byte(data, pos + 7) * 256
+			local p2   = string.byte(data, pos + 8)
+			pos = pos + 9
+
+			local pal = gct
+			if p2 >= 128 then
+				local n = math.floor(2 ^ (p2 % 8 + 1))
+				pal = {}
+				for i = 0, n - 1 do
+					pal[i] = string.char(string.byte(data, pos), string.byte(data, pos + 1), string.byte(data, pos + 2), 255)
+					pos = pos + 3
+				end
+			end
+			local interlaced = p2 % 128 >= 64
+			local minCode = string.byte(data, pos); pos = pos + 1
+
+			local chunks = {}
+			while true do
+				local len = string.byte(data, pos); pos = pos + 1
+				if not len or len == 0 then break end
+				chunks[#chunks + 1] = string.sub(data, pos, pos + len - 1)
+				pos = pos + len
+			end
+
+			index = index + 1
+			if ((index - 1) % stride == 0) and pal and fw > 0 and fh > 0 then
+				if prevDisposal == 2 and prevRect then
+					for y = prevRect.top, math.min(prevRect.top + prevRect.h - 1, dh - 1) do
+						local base = y * dw
+						for x = prevRect.left, math.min(prevRect.left + prevRect.w - 1, dw - 1) do
+							canvas[base + x + 1] = Z4
+						end
+					end
+				elseif prevDisposal == 3 and snapshot then
+					for i = 1, cells do canvas[i] = snapshot[i] end
+				end
+				if disposal == 3 then
+					snapshot = table.create(cells)
+					for i = 1, cells do snapshot[i] = canvas[i] end
+				end
+
+				local indices = Engine.lzw(table.concat(chunks), minCode, fw * fh, tick)
+				local rowOrder = interlaced and Engine.interlace(fh) or nil
+				local ib = string.byte
+
+				for sy = 0, fh - 1 do
+					local dy = rowOrder and rowOrder[sy + 1] or sy
+					local oy = top + dy
+					local destRow = math.floor(oy / step) * dw
+					local useRow = (step == 1) or (oy % step == 0)
+					local srcBase = sy * fw
+					if useRow then
+						for sx = 1, fw do
+							local idx = ib(indices, srcBase + sx)
+							if idx and not (transFlag and idx == transIndex) then
+								local ox = left + sx - 1
+								if step == 1 or (ox % step == 0) then
+									local c = pal[idx]
+									if c then
+										local di = destRow + math.floor(ox / step) + 1
+										if di >= 1 and di <= cells then canvas[di] = c end
+									end
+								end
+							end
+						end
+					end
+					if tick and sy % 24 == 0 then tick() end
+				end
+
+				frames[#frames + 1] = table.concat(canvas)
+				local d = delayCs / 100
+				if d < 0.04 then d = 0.1 elseif d > 1 then d = 1 end
+				delays[#delays + 1] = d * stride
+				prevDisposal = disposal
+				prevRect = {
+					left = math.floor(left / step),
+					top = math.floor(top / step),
+					w = math.ceil(fw / step),
+					h = math.ceil(fh / step),
+				}
+			end
+		else
+			break
+		end
+	end
+
+	if #frames == 0 then return nil end
+	return { w = dw, h = dh, frames = frames, delays = delays, step = step }
+end
+
+function Engine.sheet(gif, tick)
+	local fw, fh = gif.w, gif.h
+	local n = #gif.frames
+	local cols = math.max(1, math.min(n, 8, math.floor(Engine.MAX_DIM / fw)))
+	local maxRows = math.max(1, math.floor(Engine.MAX_DIM / fh))
+	if math.ceil(n / cols) > maxRows then
+		local step = math.ceil(n / (cols * maxRows))
+		local f, d = {}, {}
+		for i = 1, n, step do f[#f + 1] = gif.frames[i]; d[#d + 1] = gif.delays[i] end
+		gif.frames, gif.delays, n = f, d, #f
+	end
+	local rows = math.ceil(n / cols)
+	local sheetW, sheetH = cols * fw, rows * fh
+	local blank = string.rep("\0", fw * 4)
+
+	local parts = table.create(rows * fh)
+	local k = 0
+	for sy = 0, rows - 1 do
+		for fy = 0, fh - 1 do
+			local line = table.create(cols)
+			for cx = 0, cols - 1 do
+				local f = gif.frames[sy * cols + cx + 1]
+				line[cx + 1] = f and string.sub(f, fy * fw * 4 + 1, (fy + 1) * fw * 4) or blank
+			end
+			k = k + 1
+			parts[k] = table.concat(line)
+			if tick and k % 64 == 0 then tick() end
+		end
+	end
+
+	return { w = sheetW, h = sheetH, fw = fw, fh = fh, cols = cols, rows = rows,
+		n = n, delays = gif.delays, cap = gif.cap, data = table.concat(parts) }
+end
+
+function Engine.toPNG(sheet, tick)
+	local w4, d = sheet.w * 4, sheet.data
+	local parts = table.create(sheet.h)
+	for y = 0, sheet.h - 1 do
+		parts[y + 1] = "\0" .. string.sub(d, y * w4 + 1, (y + 1) * w4)
+		if tick and y % 128 == 0 then tick() end
+	end
+	return Engine.png(sheet.w, sheet.h, table.concat(parts), tick)
+end
+
+function Engine.toBuffer(sheet)
+	local buf = buffer.create(#sheet.data)
+	buffer.writestring(buf, 0, sheet.data)
+	return buf
+end
+
+Engine.probePNG = Engine.png(1, 1, "\0\255\0\0\255")
+
+-- ╔══════════════════════════════════════════════════════════╗
+-- ║  FILESYSTEM + FETCH                                      ║
+-- ╚══════════════════════════════════════════════════════════╝
+FS.mkdir = makefolder or make_folder
+FS.exist = isfile or isFile
+FS.asset = getcustomasset or getsynasset
+FS.write = writefile or write_file
+FS.read  = readfile or read_file
+FS.ok = type(FS.write) == "function" and type(FS.read) == "function"
+	and type(FS.exist) == "function" and type(FS.mkdir) == "function" and type(FS.asset) == "function"
+FS.cache = "nebula_gif_cache_v6"
+if FS.ok then pcall(FS.mkdir, FS.cache) end
+
+FS.probeFile, FS.probeEdit = false, false
+if FS.ok then
+	FS.probeFile = pcall(function()
+		local p = FS.cache .. "/_probe.png"
+		FS.write(p, Engine.probePNG)
+		local a = FS.asset(p)
+		if type(a) ~= "string" or #a == 0 then error("no asset") end
+	end)
+end
+if type(buffer) == "table" then
+	FS.probeEdit = pcall(function()
+		local ei = AssetSvc:CreateEditableImage({ Size = Vector2.new(2, 2) })
+		ei:WritePixelsBuffer(Vector2.zero, Vector2.new(2, 2), buffer.create(16))
+	end)
+end
+
+function FS.hash(s)
+	local h = 5381
+	for i = 1, #s do h = (h * 33 + string.byte(s, i)) % 4294967296 end
+	return string.format("%08x", h)
+end
+function FS.strip(u) return (u:gsub("%?.*$", "")) end
+function FS.enc(s)
+	return (s:gsub("[^%w%-%_%.%~]", function(c) return string.format("%%%02X", string.byte(c)) end))
+end
+
+function FS.fetch(url)
+	for _, fn in ipairs({
+		function()
+			if type(request) == "function" then
+				local r = request({ Url = url, Method = "GET" })
+				return r and r.Body
+			end
+		end,
+		function() if type(game.HttpGet) == "function" then return game:HttpGet(url) end end,
+		function() if type(game.HttpGetAsync) == "function" then return game:HttpGetAsync(url) end end,
+		function() return Http:GetAsync(url, true) end,
+	}) do
+		local ok, body = pcall(fn)
+		if ok and type(body) == "string" and #body > 64 and string.sub(body, 1, 3) == "GIF" then return body end
+	end
+	return nil
+end
+
+-- raw GIF byte cache: repeats never touch the network
+function FS.bytesPath(clean) return FS.cache .. "/" .. FS.hash(clean) .. ".gif" end
+function FS.bytesRead(clean)
+	if not FS.ok then return nil end
+	local p = FS.bytesPath(clean)
+	local ok, raw = pcall(FS.read, p)
+	if ok and type(raw) == "string" and #raw > 64 and string.sub(raw, 1, 3) == "GIF" then return raw end
+	return nil
+end
+function FS.bytesWrite(clean, raw)
+	if not FS.ok or type(raw) ~= "string" then return end
+	pcall(FS.write, FS.bytesPath(clean), raw)
+end
+
+-- asset cache keyed by URL *and* decode cap
+function FS.cacheRead(clean, cap)
+	if not FS.probeFile then return nil end
+	local id = FS.hash(clean .. "|" .. tostring(cap))
+	local pngPath, metaPath = FS.cache .. "/" .. id .. ".png", FS.cache .. "/" .. id .. ".meta"
+	if not FS.exist(pngPath) or not FS.exist(metaPath) then return nil end
+	local okm, meta = pcall(FS.read, metaPath)
+	if not okm or type(meta) ~= "string" then return nil end
+	local n, fw, fh, cols, delays = meta:match("^(%d+)|(%d+)|(%d+)|(%d+)|(.*)$")
+	if not n or not fw or not fh or not cols then return nil end
+	local ok, a = pcall(FS.asset, pngPath)
+	if not ok or type(a) ~= "string" or #a == 0 then return nil end
+	local list = {}
+	for piece in string.gmatch(delays or "", "[^,]+") do list[#list + 1] = tonumber(piece) or 0.1 end
+	if #list == 0 then list[1] = 0.1 end
+	return { asset = a, fw = tonumber(fw), fh = tonumber(fh), n = tonumber(n),
+		cols = tonumber(cols), delays = list, cap = cap }
+end
+
+function FS.toFile(sheet, clean, tick)
+	if not FS.probeFile then return nil end
+	local id = FS.hash(clean .. "|" .. tostring(sheet.cap or Engine.CHAT_CAP))
+	local pngPath, metaPath = FS.cache .. "/" .. id .. ".png", FS.cache .. "/" .. id .. ".meta"
+	if FS.exist(pngPath) and FS.exist(metaPath) then
+		local ok, a = pcall(FS.asset, pngPath)
+		if ok and type(a) == "string" and #a > 0 then return a end
+	end
+	local png = Engine.toPNG(sheet, tick)
+	if not pcall(FS.write, pngPath, png) then return nil end
+	pcall(FS.write, metaPath, sheet.n .. "|" .. sheet.fw .. "|" .. sheet.fh .. "|" .. sheet.cols .. "|" .. table.concat(sheet.delays, ","))
+	local ok, a = pcall(FS.asset, pngPath)
+	if ok and type(a) == "string" and #a > 0 then return a end
+	return nil
+end
+
+function FS.toEditable(sheet)
+	if not FS.probeEdit then return nil end
+	local ok, ei = pcall(function() return AssetSvc:CreateEditableImage({ Size = Vector2.new(sheet.w, sheet.h) }) end)
+	if not ok or not ei then return nil end
+	if not pcall(function() ei:WritePixelsBuffer(Vector2.zero, Vector2.new(sheet.w, sheet.h), Engine.toBuffer(sheet)) end) then return nil end
+	return ei
+end
+
+-- ╔══════════════════════════════════════════════════════════╗
+-- ║  GIF QUEUE + MEMO + BYTE PREFETCH                        ║
+-- ╚══════════════════════════════════════════════════════════╝
+Q.animated = {}
+Q.memo, Q.memoOrder = {}, {}
+Q.bytes = {}
+Q.list = {}
+Q.live, Q.MAX_WORKERS = 0, (UI.isTouch and 3 or 5)
+Q.fetchLive, Q.FETCH_MAX = 0, 6
+Q.stats = { edit = 0, ok = 0, hit = 0, url = 0 }
+
+function Q.put(key, rec)
+	if Q.memo[key] then return end
+	Q.memo[key] = rec
+	Q.memoOrder[#Q.memoOrder + 1] = key
+	if #Q.memoOrder > 320 then
+		Q.memo[table.remove(Q.memoOrder, 1)] = nil
+	end
+end
+
+function Q.apply(label, rec)
+	if rec.ei then
+		local ok = pcall(function() label.ImageContent = Content.fromObject(rec.ei) end)
+		if not ok then ok = pcall(function() label.ImageContent = rec.ei end) end
+		if ok then
+			label.ImageRectSize = Vector2.new(rec.fw, rec.fh)
+			label.ImageRectOffset = Vector2.new(0, 0)
+			if rec.n > 1 then
+				Q.animated[#Q.animated + 1] = { label = label, n = rec.n, fw = rec.fw, fh = rec.fh,
+					cols = rec.cols, delays = rec.delays, t = 0, i = 1, ref = rec.ei }
+			end
+			return true
+		end
+	end
+	if rec.asset then
+		label.Image = rec.asset
+		label.ImageRectSize = Vector2.new(rec.fw, rec.fh)
+		label.ImageRectOffset = Vector2.new(0, 0)
+		if rec.n > 1 then
+			Q.animated[#Q.animated + 1] = { label = label, n = rec.n, fw = rec.fw, fh = rec.fh,
+				cols = rec.cols, delays = rec.delays, t = 0, i = 1 }
+		end
+		return true
+	end
+	return false
+end
+
+function Q.prefetch(url)
+	if Q.bytes[url] ~= nil then return end
+	Q.bytes[url] = false
+	task.spawn(function()
+		local disk = FS.bytesRead(url)
+		if disk then Q.bytes[url] = disk; return end
+		while Q.fetchLive >= Q.FETCH_MAX do task.wait(0.03) end
+		Q.fetchLive = Q.fetchLive + 1
+		local b = FS.fetch(url)
+		Q.fetchLive = Q.fetchLive - 1
+		if b then FS.bytesWrite(url, b) end
+		Q.bytes[url] = b or ""
+	end)
+end
+
+function Q.getBytes(url, timeout)
+	local disk = FS.bytesRead(url)
+	if disk then Q.bytes[url] = disk; return disk end
+	local b = Q.bytes[url]
+	if b == nil then
+		Q.prefetch(url)
+		b = Q.bytes[url]
+	end
+	if b == false then
+		local t0 = os.clock()
+		while Q.bytes[url] == false do
+			if os.clock() - t0 > (timeout or 12) then return nil end
+			task.wait()
+		end
+		b = Q.bytes[url]
+	end
+	if b == nil or b == "" then return nil end
+	return b
+end
+
+function Q.push(fn)
+	Q.list[#Q.list + 1] = fn
+	Q.pump()
+end
+
+function Q.pump()
+	while Q.live < Q.MAX_WORKERS and #Q.list > 0 do
+		Q.live = Q.live + 1
+		task.spawn(function()
+			local t0 = os.clock()
+			while #Q.list > 0 do
+				local job = table.remove(Q.list, 1)
+				if job then pcall(job) end
+				if os.clock() - t0 > 0.012 then
+					t0 = os.clock()
+					task.wait()
+				end
+				if #Q.list == 0 then break end
+			end
+			Q.live = Q.live - 1
+			if #Q.list > 0 then Q.pump() end
+		end)
+	end
+end
+
+function Q.attach(label, candidates, isTile)
+	local cap = isTile and Engine.TILE_CAP or Engine.CHAT_CAP
+	local first = candidates[1]
+	if first then
+		local clean = FS.strip(first)
+		if not (Q.memo[clean .. "|" .. cap] or FS.cacheRead(clean, cap)) then Q.prefetch(clean) end
+	end
+	Q.push(function()
+		for _, raw in ipairs(candidates) do
+			if not label.Parent then return end
+			local clean = FS.strip(raw)
+			local key = clean .. "|" .. cap
+
+			local rec = Q.memo[key]
+			if rec and Q.apply(label, rec) then return end
+
+			rec = FS.cacheRead(clean, cap)
+			if rec and Q.apply(label, rec) then
+				Q.put(key, rec)
+				Q.stats.hit = Q.stats.hit + 1
+				return
+			end
+
+			local bytes = Q.getBytes(clean)
+			if bytes then
+				local tick = Engine.ticker(Engine.STEP)
+				local okd, gif = pcall(Engine.decode, bytes, tick, cap)
+				if okd and gif then
+					gif.cap = cap
+					local oks, sheet = pcall(Engine.sheet, gif, tick)
+					if oks and sheet then
+						gif.frames = nil
+						if not label.Parent then return end
+
+						local ei
+						pcall(function() ei = FS.toEditable(sheet) end)
+						if ei then
+							local r = { ei = ei, fw = sheet.fw, fh = sheet.fh, n = sheet.n,
+								cols = sheet.cols, delays = sheet.delays, cap = cap }
+							if Q.apply(label, r) then
+								Q.stats.edit = Q.stats.edit + 1
+								Q.put(key, r)
+								return
+							end
+						end
+
+						local asset
+						pcall(function() asset = FS.toFile(sheet, clean, tick) end)
+						if asset then
+							local r = { asset = asset, fw = sheet.fw, fh = sheet.fh, n = sheet.n,
+								cols = sheet.cols, delays = sheet.delays, cap = cap }
+							if Q.apply(label, r) then
+								Q.stats.ok = Q.stats.ok + 1
+								Q.put(key, r)
+								return
+							end
+						end
+					end
+				end
+			end
+		end
+		Q.stats.url = Q.stats.url + 1
+		if label.Parent and candidates[1] then label.Image = FS.strip(candidates[1]) end
+	end)
+end
+
+track(RunService.Heartbeat:Connect(function(dt)
+	local a = Q.animated
+	for i = #a, 1, -1 do
+		local f = a[i]
+		if not f.label.Parent then
+			table.remove(a, i)
+		elseif f.n > 1 then
+			f.t = f.t + dt
+			local d = f.delays[f.i] or 0.1
+			if f.t >= d then
+				f.t = f.t - d
+				f.i = f.i % f.n + 1
+				local idx = f.i - 1
+				f.label.ImageRectOffset = Vector2.new((idx % f.cols) * f.fw, math.floor(idx / f.cols) * f.fh)
+			end
+		end
+	end
+end))
+
+-- ╔══════════════════════════════════════════════════════════╗
+-- ║  GIF SOURCES  ·  GIPHY (primary) + KLIPY (fallback)      ║
+-- ╚══════════════════════════════════════════════════════════╝
+-- Tenor's public API was discontinued on 30 Jun 2026, so its
+-- branch is gone. KLIPY is the drop-in replacement and speaks
+-- the same /v2 shape Tenor used, which is why the parsing below
+-- still reads media_formats.
+--
+-- Giphy: free keys at https://developers.giphy.com/  (100/hr)
+-- KLIPY: free keys at https://partner.klipy.com/api-keys (100/hr)
+--
+-- Pool order matters: keys are tried in order and rotated out of
+-- the way on 403/429. Add your own at the top of either list, or
+-- paste one into the picker at runtime (it is saved to disk).
+API.giphyKeys = {
+	"Gc7131jiJuvI7IdN0HZ1D7nh0ow5BU6g",
+	"sXpGFDGZs0Dv1mmNFvYaGUvYwKX0PWIh",
+}
+API.klipyKeys = {
+	-- "PASTE_YOUR_KLIPY_KEY_HERE",
+}
+API.keyPath = "nebula_gif_keys.json"
+API.tilePrefs = { "preview_gif", "fixed_height_small", "downsized_small", "fixed_height" }
+API.rating, API.page = "pg-13", 20
+API.active = { source = nil, key = nil, note = "probing" }
+API.done, API.busy = false, false
+
+-- _G overrides, so a host script can inject keys without editing
+local function seed(list, override)
+	if type(override) == "string" and #override > 0 then
+		table.insert(list, 1, override)
+	elseif type(override) == "table" then
+		for i = #override, 1, -1 do
+			if type(override[i]) == "string" and #override[i] > 0 then table.insert(list, 1, override[i]) end
+		end
+	end
+end
+seed(API.giphyKeys, _G.NEBULA_GIPHY_KEYS)
+seed(API.klipyKeys, _G.NEBULA_KLIPY_KEYS)
+
+function API.loadKeys()
+	if not FS.ok then return end
+	local ok, raw = pcall(FS.read, API.keyPath)
+	if not ok or type(raw) ~= "string" or #raw == 0 then return end
+	local okd, d = pcall(Http.JSONDecode, Http, raw)
+	if not okd or type(d) ~= "table" then return end
+	for _, src in ipairs({ "giphy", "klipy" }) do
+		local list = (src == "giphy") and API.giphyKeys or API.klipyKeys
+		if type(d[src]) == "table" then
+			for _, k in ipairs(d[src]) do
+				if type(k) == "string" and #k > 0 and not inList(list, k) then table.insert(list, 1, k) end
+			end
+		end
+	end
+end
+
+function API.saveKeys()
+	if not FS.ok then return end
+	pcall(function()
+		FS.write(API.keyPath, Http:JSONEncode({ giphy = API.giphyKeys, klipy = API.klipyKeys }))
+	end)
+end
+
+function API.addKey(source, key)
+	local list = (source == "klipy") and API.klipyKeys or API.giphyKeys
+	if inList(list, key) then return false end
+	table.insert(list, 1, key)
+	API.saveKeys()
+	return true
+end
+
+function API.get(url)
+	local ok, res = pcall(function()
+		return Http:RequestAsync({ Url = url, Method = "GET",
+			Headers = { ["User-Agent"] = "NebulaChat/9.8.9", ["Accept"] = "application/json" } })
+	end)
+	if ok and res and res.Success then return res.Body, res.StatusCode or 200 end
+	return nil, ok and res and res.StatusCode or "err"
+end
+
+-- a dead key can answer 200 with an empty body, so the payload is
+-- checked rather than the status alone
+function API.probeGiphy(k)
+	local body, code = API.get("https://api.giphy.com/v1/gifs/trending?api_key=" .. k .. "&limit=1")
+	if not body then return false, code end
+	local ok, d = pcall(Http.JSONDecode, Http, body)
+	if not ok or type(d) ~= "table" then return false, "bad json" end
+	if type(d.data) == "table" and d.data[1] and type(d.data[1].images) == "table" then return true end
+	return false, (type(d.meta) == "table" and tostring(d.meta.status) .. " " .. tostring(d.meta.msg)) or "empty"
+end
+
+function API.probeKlipy(k)
+	local body, code = API.get("https://api.klipy.com/v2/featured?key=" .. k .. "&limit=1&media_filter=gif")
+	if not body then return false, code end
+	local ok, d = pcall(Http.JSONDecode, Http, body)
+	if not ok or type(d) ~= "table" then return false, "bad json" end
+	if type(d.results) == "table" and d.results[1] then return true end
+	return false, "empty"
+end
+
+function API.probe()
+	if API.busy then return end
+	API.busy = true
+	local last = ""
+	for _, k in ipairs(API.giphyKeys) do
+		local ok, why = API.probeGiphy(k)
+		if ok then
+			API.active.source, API.active.key, API.active.note, API.done = "giphy", k, "giphy ok", true
+			API.busy = false
+			return
+		end
+		last = "giphy " .. tostring(why)
+	end
+	for _, k in ipairs(API.klipyKeys) do
+		local ok, why = API.probeKlipy(k)
+		if ok then
+			API.active.source, API.active.key, API.active.note, API.done = "klipy", k, "klipy fallback", true
+			API.busy = false
+			return
+		end
+		last = last .. " | klipy " .. tostring(why)
+	end
+	API.active.source, API.active.key = nil, nil
+	API.active.note, API.done = "no key: " .. last, true
+	API.busy = false
+end
+
+-- drop the current key and re-probe on quota / ban answers
+function API.rotate(why)
+	local list = (API.active.source == "klipy") and API.klipyKeys or API.giphyKeys
+	if #list > 1 and API.active.key then
+		for i, k in ipairs(list) do
+			if k == API.active.key then table.remove(list, i); break end
+		end
+	end
+	API.done = false
+	task.spawn(API.probe)
+	return "rotating key (" .. tostring(why) .. ")"
+end
+
+function API.clean(t)
+	t = (t or ""):gsub("[%c]", " "):gsub("%s+", " ")
+	t = t:gsub("^%s+", ""):gsub("%s+$", "")
+	t = t:gsub("%s*GIF%s*$", "")
+	if #t == 0 then t = "GIF" end
+	t = utf8Cut(t, 22)
+	if #t >= 22 then t = t .. "…" end
+	return t
+end
+
+function API.variants(images)
+	local out = {}
+	for _, key in ipairs(API.tilePrefs) do
+		local v = images[key]
+		if type(v) == "table" and type(v.url) == "string" and #v.url > 0
+		and string.sub(FS.strip(v.url), -4) == ".gif" then
+			out[#out + 1] = { url = v.url, w = tonumber(v.width) or 200, h = tonumber(v.height) or 150 }
+		end
+	end
+	return out
+end
+
+function API.fromGiphy(query, offset)
+	local url
+	if query == "" then
+		url = "https://api.giphy.com/v1/gifs/trending?api_key=" .. API.active.key
+			.. "&limit=" .. API.page .. "&offset=" .. offset .. "&rating=" .. API.rating
+	else
+		url = "https://api.giphy.com/v1/gifs/search?api_key=" .. API.active.key .. "&q=" .. FS.enc(query)
+			.. "&limit=" .. API.page .. "&offset=" .. offset .. "&rating=" .. API.rating .. "&lang=en"
+	end
+	local body, code = API.get(url)
+	if not body then return nil, API.rotate(code) end
+	local ok, data = pcall(Http.JSONDecode, Http, body)
+	if not ok or type(data) ~= "table" or type(data.data) ~= "table" then return nil, "bad json" end
+	if #data.data == 0 and type(data.meta) == "table" and tonumber(data.meta.status) ~= 200 then
+		return nil, API.rotate(data.meta.msg or data.meta.status)
+	end
+	local out = {}
+	for _, g in ipairs(data.data) do
+		if type(g.images) == "table" then
+			local all = API.variants(g.images)
+			if #all > 0 then out[#out + 1] = { urls = all, name = API.clean(g.title) } end
+		end
+	end
+	return out
+end
+
+function API.fromKlipy(query, offset)
+	local url
+	if query == "" then
+		url = "https://api.klipy.com/v2/featured?key=" .. API.active.key .. "&limit=" .. API.page
+			.. "&media_filter=gif,tinygif"
+	else
+		url = "https://api.klipy.com/v2/search?q=" .. FS.enc(query) .. "&key=" .. API.active.key
+			.. "&limit=" .. API.page .. "&media_filter=gif,tinygif"
+	end
+	if offset > 0 then url = url .. "&pos=" .. tostring(offset) end
+	local body, code = API.get(url)
+	if not body then return nil, API.rotate(code) end
+	local ok, data = pcall(Http.JSONDecode, Http, body)
+	if not ok or type(data) ~= "table" or type(data.results) ~= "table" then return nil, "bad json" end
+	if #data.results == 0 and data.error then return nil, API.rotate(data.error) end
+	local out = {}
+	for _, r in ipairs(data.results) do
+		local mf = r.media_formats
+		if type(mf) == "table" then
+			local list = {}
+			for _, key in ipairs({ "tinygif", "nanogif", "gif", "mediumgif" }) do
+				local v = mf[key]
+				if type(v) == "table" and type(v.url) == "string" and #v.url > 0
+				and string.sub(FS.strip(v.url), -4) == ".gif" then
+					local dims = v.dims or { 200, 150 }
+					list[#list + 1] = { url = v.url, w = dims[1] or 200, h = dims[2] or 150 }
+				end
+			end
+			if #list > 0 then out[#out + 1] = { urls = list, name = API.clean(r.content_description or r.title) } end
+		end
+	end
+	return out
+end
+
+function API.search(query, offset)
+	if API.active.source == "giphy" then return API.fromGiphy(query, offset) end
+	if API.active.source == "klipy" then return API.fromKlipy(query, offset) end
+	return nil, API.active.note
+end
+
+API.loadKeys()
+task.spawn(API.probe)
+
+-- ╔══════════════════════════════════════════════════════════╗
+-- ║  RELAY  ·  one pinned host + sharded lanes                ║
+-- ╚══════════════════════════════════════════════════════════╝
+-- Wire format: ntfy parses an application/json body as a
+-- publish envelope, so the payload has to ride in `message`.
+--
+-- Host: ONE server, pinned, hard-coded. No pool and no
+-- rotation — a single box for the whole room means no client
+-- can drift onto a different relay and lose half the chat.
+-- ntfy.envs.net is the one that accepts publishes and nests
+-- the payload one level deeper (see Net.handle). It is a
+-- literal, not a _G override, so every copy of this script
+-- lands on the same box. To move the room, edit this line and
+-- hand out the new copy.
+Net.PINNED = "ntfy.envs.net"
+Net.host = Net.PINNED
+Net.url, Net.wsUrl = "https://" .. Net.host .. "/", "wss://" .. Net.host .. "/"
+Net.hostReady = false
+Net.probing = false
+Net.pubFails = 0
+Net.hsFails = 0
+Net.retry, Net.closing = {}, {}
+Net.PRES_TTL = 24
+
+-- ntfy rate-limits per topic per visitor, so one busy room
+-- starts answering 429 once a few dozen people talk at once.
+-- The room is therefore split over SHARDS lanes: every client
+-- reads all of them, writes to the one it hashes to, and owner
+-- config goes out on all of them. Nothing is lost, but no
+-- single topic carries the whole room. All lanes are on the
+-- one pinned host, so lanes never mean a different server.
+Net.baseTopic = "nebula_global_chat_v1"
+Net.SHARDS = 4
+Net.shards, Net.shardOf = {}, {}
+for i = 1, Net.SHARDS do
+	Net.shards[i] = Net.baseTopic .. "_s" .. i
+	Net.shardOf[Net.shards[i]] = i
+end
+Net.myShard = ((plr.UserId or 0) % Net.SHARDS) + 1
+Net.topic = Net.shards[Net.myShard]        -- legacy field
+Net.seed = tostring(math.floor((os.time and os.time() or 0) - 6 * 3600))
+Net.since = Net.seed                        -- legacy field
+Net.sinceTab = {}
+for i = 1, Net.SHARDS do Net.sinceTab[i] = Net.seed end
+Net.seen, Net.seenOrder = {}, {}
+Net.sent, Net.sentOrder = {}, {}
+Net.inbox, Net.inboxN = {}, 0
+Net.socks, Net.wsTrying = {}, {}
+Net.presence = Net.presence or {}
+Net.presenceN = tonumber(Net.presenceN) or 1
+Net.sid = Net.sid or string.format("%d-%x", plr.UserId or 0, math.random(1, 0x7FFFFFFF))
+Net.presence[Net.sid] = { at = os.clock(), name = plr.Name }
+Net.gifsOffset, Net.searchToken = 0, 0
+Net.online, Net.live, Net.wsReady = false, false, false
+Net.gameName = "Unknown Game"
+Net.dropped = 0
+
+-- live presence, read by the pill and the roster
+function Net.liveList()
+	local now = os.clock()
+	local out = {}
+	for sid, rec in pairs(Net.presence) do
+		if rec and (now - (rec.at or 0)) < Net.PRES_TTL then
+			out[#out + 1] = { sid = sid, n = rec.name or "?" }
+		end
+	end
+	table.sort(out, function(a, b) return lc(a.n) < lc(b.n) end)
+	return out
+end
+
+function Net.anySock()
+	for i = 1, Net.SHARDS do if Net.socks[i] then return true end end
+	return false
+end
+
+function Net.closeLanes()
+	for i = 1, Net.SHARDS do
+		local s = Net.socks[i]
+		if s then
+			Net.closing[i] = true
+			Net.socks[i] = nil
+			pcall(function() s:Close() end)
+		end
+		Net.wsTrying[i] = false
+	end
+	Net.refresh()
+end
+
+function Net.openLanes()
+	for i = 1, Net.SHARDS do
+		if not running then return end
+		Net.startWS(i)
+		task.wait(0.25)
+	end
+end
+
+-- The host has to accept a publish before the link is trusted: a
+-- read-only mirror answers a poll and then swallows every send,
+-- which looks alive and is not. Once trusted the link is kept —
+-- publishing and receiving are separate concerns, so a bad send
+-- never closes a socket that is happily receiving.
+function Net.handshake()
+	if Net.probing or not running then return false end
+	if Net.anySock() then Net.hostReady = true; return true end
+	if Net.hostReady then task.spawn(Net.openLanes); return true end
+	Net.probing = true
+	local ok = Net.post({ sys = "probe", u = plr.Name, sid = Net.sid }, Net.myShard)
+	Net.probing = false
+	if ok then
+		Net.hostReady = true
+		Net.pubFails = 0
+		Net.setLink("online")
+		H.flash("relay: " .. Net.host, UI.C.OKC)
+		task.spawn(Net.openLanes)
+		return true
+	end
+	Net.setLink("down")
+	return false
+end
+
+task.spawn(function()
+	local ok, info = pcall(function() return game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId) end)
+	if ok and info and info.Name then Net.gameName = info.Name; H.status() end
+end)
+
+function Net.markSent(cid)
+	if not cid then return end
+	Net.sent[cid] = true
+	Net.sentOrder[#Net.sentOrder + 1] = cid
+	if #Net.sentOrder > 200 then Net.sent[table.remove(Net.sentOrder, 1)] = nil end
+end
+
+-- seen list is capped so a long session can't grow it forever
+function Net.markSeen(id)
+	if not id or Net.seen[id] then return end
+	Net.seen[id] = true
+	Net.seenOrder[#Net.seenOrder + 1] = id
+	if #Net.seenOrder > 4000 then Net.seen[table.remove(Net.seenOrder, 1)] = nil end
+end
+
+function Net.post(payload, shard)
+	local topic = Net.shards[shard or Net.myShard] or Net.shards[1]
+	local ok, res = pcall(function()
+		return Http:RequestAsync({ Url = Net.url .. topic, Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" }, Body = Http:JSONEncode(payload) })
+	end)
+	if ok and res and res.Success then
+		local okd, dec = pcall(Http.JSONDecode, Http, res.Body)
+		local id = okd and dec and dec.id or nil
+		local ts = okd and dec and tonumber(dec.time) or nil
+		if id then Net.markSeen(id) end
+		Net.pubFails = 0
+		Net.hostReady = true
+		return true, id, ts
+	end
+	-- a failed send leaves every socket alone; the link is only
+	-- given up when nothing is connected either
+	Net.pubFails = (Net.pubFails or 0) + 1
+	if Net.pubFails >= 6 then
+		Net.pubFails = 0
+		if not Net.anySock() then
+			Net.hostReady = false
+			Net.setLink("down")
+		end
+	end
+	return false, nil, nil
+end
+
+-- config has to reach every lane, otherwise half the room misses it
+function Net.postAll(payload)
+	task.spawn(function()
+		for i = 1, Net.SHARDS do
+			if not running then return end
+			Net.post(payload, i)
+			task.wait(0.35)
+		end
+	end)
+end
+
+function Net.broadcast()
+	Net.postAll({ sys = "cfg", u = plr.Name, slow = Cfg.slow, bl = Cfg.blacklist,
+		purge = Cfg.purgeTs, del = Cfg.del })
+end
+
+function Net.delBroadcast()
+	Net.postAll({ sys = "cfg", u = plr.Name, del = Cfg.del })
+end
+
+function Net.setLink(state)
+	local nOnline, nLive = state ~= "down", state == "live"
+	if nOnline == Net.online and nLive == Net.live then return end
+	Net.online, Net.live = nOnline, nLive
+	H.status()
+end
+
+function Net.refresh()
+	Net.wsReady = Net.anySock()
+	if Net.wsReady then
+		Net.setLink("live")
+	elseif Net.hostReady then
+		Net.setLink("online")
+	end
+end
+
+function Net.lib()
+	if type(WebSocket) == "table" and type(WebSocket.connect) == "function" then return WebSocket end
+	local ok, g = pcall(function() return getgenv and getgenv() end)
+	if ok and type(g) == "table" and type(g.WebSocket) == "table" and type(g.WebSocket.connect) == "function" then
+		return g.WebSocket
+	end
+	return nil
+end
+
+function Net.bind(sock, names, fn)
+	for _, n in ipairs(names) do
+		local v = sock[n]
+		if v ~= nil then
+			if type(v) == "function" then
+				if pcall(function() v(sock, fn) end) then return true end
+			else
+				if pcall(function() v:Connect(fn) end) then return true end
+			end
+		end
+	end
+	return false
+end
+
+function Net.startWS(i)
+	if not running or not Net.hostReady then return end
+	if Net.socks[i] or Net.wsTrying[i] then return end
+	Net.wsTrying[i] = true
+	local lib = Net.lib()
+	if not lib then Net.wsTrying[i] = false; return end
+
+	local ok, sock = pcall(lib.connect,
+		Net.wsUrl .. Net.shards[i] .. "/ws?since=" .. Net.sinceTab[i])
+	if not ok or not sock then Net.wsTrying[i] = false; return end
+
+	if not Net.bind(sock, { "OnTextMessage", "OnMessage", "Message" }, function(m) Net.enqueue(m) end) then
+		pcall(function() sock:Close() end)
+		Net.wsTrying[i] = false
+		return
+	end
+
+	Net.socks[i] = sock
+	Net.wsTrying[i] = false
+	Net.retry[i] = 0
+	_G.__NebulaChatWS = sock
+	Net.refresh()
+	H.flash("live chat connected", UI.C.OKC)
+
+	-- reconnect this lane on its own, with backoff and jitter, so
+	-- one dropped socket never becomes a full reconnect storm
+	Net.bind(sock, { "OnClose", "Close", "onclose" }, function()
+		if Net.socks[i] == sock then Net.socks[i] = nil end
+		_G.__NebulaChatWS = nil
+		Net.refresh()
+		if Net.closing[i] then Net.closing[i] = nil; return end
+		if not running then return end
+		Net.retry[i] = math.min((Net.retry[i] or 0) + 1, 5)
+		local wait = math.min(25, 1.2 * 2 ^ (Net.retry[i] - 1)) * (0.8 + math.random() * 0.4)
+		task.delay(wait, function()
+			if running and Net.hostReady then Net.startWS(i) end
+		end)
+	end)
+	Net.bind(sock, { "OnError", "Error", "onerror" }, function() end)
+end
+
+-- raw lines are parked here and decoded in batches
+function Net.enqueue(line)
+	if type(line) ~= "string" or #line == 0 then return end
+	if Net.inboxN >= 600 then return end
+	Net.inboxN = Net.inboxN + 1
+	Net.inbox[Net.inboxN] = line
+end
+
+-- ── inbound sanity gate ─────────────────────────────────────
+-- The lanes are public and the sockets replay from a cursor, so
+-- a line can arrive as a partial frame, an empty payload, or a
+-- non-chat envelope. Ungated, each of those landed in the list
+-- as a blank bubble credited to "?". Nothing reaches V.push
+-- now unless it has a body (or a real image URL) and a sender
+-- that reads like a name.
+function Net.cleanText(s)
+	if type(s) ~= "string" then return "" end
+	s = s:gsub("[%z\1-\8\11\12\14-\31]", "")
+	s = s:gsub("%s+", " ")
+	s = s:gsub("^%s+", ""):gsub("%s+$", "")
+	return s
+end
+
+function Net.cleanUser(u)
+	if type(u) ~= "string" then return nil end
+	u = u:gsub("[%c]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+	if #u == 0 or #u > 32 then return nil end
+	if u == "?" or u == "nil" or u == "null" or u == "unknown" then return nil end
+	if #(u:gsub("[%s%p]", "")) == 0 then return nil end
+	return u
+end
+
+function Net.cleanImg(v)
+	if type(v) ~= "string" then return nil end
+	v = v:gsub("%s", "")
+	if #v < 12 or #v > 512 then return nil end
+	if string.sub(v, 1, 4) ~= "http" and string.sub(v, 1, 8) ~= "rbxasset" then return nil end
+	if not v:find("%.") then return nil end
+	return v
+end
+
+function Net.handle(line)
+	if type(line) ~= "string" or #line == 0 then return end
+	local dok, msg = pcall(Http.JSONDecode, Http, line)
+	if not dok or type(msg) ~= "table" then return end
+	if msg.id then
+		local si = (msg.topic and Net.shardOf[msg.topic]) or Net.myShard
+		if si and Net.sinceTab[si] then Net.sinceTab[si] = msg.id end
+	end
+	if msg.event ~= "message" then return end
+	if not msg.id or Net.seen[msg.id] then return end
+	Net.markSeen(msg.id)
+	local pok, data = pcall(Http.JSONDecode, Http, msg.message)
+	if not pok or type(data) ~= "table" then
+		Net.dropped = Net.dropped + 1
+		return
+	end
+
+	-- envs.net nests the payload one level deeper:
+	-- {"message":"{...}","topic":"..."}. Unwrapped here,
+	-- otherwise every line from it has no sender and no body.
+	if data.u == nil then
+		local inner = data.message
+		if type(inner) == "string" then
+			local ok2, d2 = pcall(Http.JSONDecode, Http, inner)
+			if ok2 and type(d2) == "table" then data = d2 end
+		elseif type(inner) == "table" then
+			data = inner
+		end
+	end
+
+	if data.cid and Net.sent[data.cid] then return end
+
+	if data.sys == "hb" then
+		local sid = tostring(data.sid or "")
+		if #sid > 0 then
+			local nm = Net.cleanUser(data.u) or "?"
+			local rec = Net.presence[sid]
+			if rec then
+				rec.at = os.clock()
+				rec.name = nm
+			else
+				Net.presence[sid] = { at = os.clock(), name = nm }
+				Net.presenceN = Net.presenceN + 1
+				H.presence()
+				if sid ~= Net.sid then H.joined(nm) end
+			end
+		end
+	elseif data.sys == "bye" then
+		local sid = tostring(data.sid or "")
+		if #sid > 0 and Net.presence[sid] then
+			Net.presence[sid] = nil
+			Net.presenceN = math.max(1, (Net.presenceN or 1) - 1)
+			H.presence()
+		end
+	elseif data.sys == "cfg" then
+		if data.del then Cfg.mergeDel(data.del) end
+		if data.slow ~= nil or data.bl ~= nil then Cfg.set(data.slow, data.bl, data.purge) end
+	elseif data.sys == "req" then
+		if Cfg.me then Net.broadcast() end
+	else
+		-- a tagged envelope with no body is not a chat line
+		if data.sys ~= nil and data.m == nil and data.img == nil then
+			Net.dropped = Net.dropped + 1
+			return
+		end
+		if Cfg.delSet[msg.id] then return end
+
+		local author = Net.cleanUser(data.u)
+		if not author then Net.dropped = Net.dropped + 1; return end
+		local body = Net.cleanText(data.m)
+		local img  = Net.cleanImg(data.img)
+		if #body == 0 and not img then Net.dropped = Net.dropped + 1; return end
+		local gname = Net.cleanText(data.g)
+		if #gname == 0 or #gname > 60 then gname = "?" end
+
+		Cfg.track(author, data.uid)
+		local t = tonumber(msg.time) or Cfg.now()
+		if t > Cfg.purgeTs and (Cfg.isOwner(author) or not Cfg.blocked(author)) then
+			local r = nil
+			if type(data.r) == "table" then
+				local ru = Net.cleanUser(data.r.u)
+				if ru then
+					r = { id = type(data.r.id) == "string" and data.r.id or nil,
+						u = ru, m = Net.cleanText(data.r.m) }
+				end
+			end
+			V.push({ id = msg.id, u = author, uid = tonumber(data.uid), g = gname,
+				m = body, img = img, iw = tonumber(data.w), ih = tonumber(data.h), t = t, r = r }, true)
+		end
+	end
+end
+
+-- ╔══════════════════════════════════════════════════════════╗
+-- ║  CONFIG / OWNERS                                         ║
+-- ╚══════════════════════════════════════════════════════════╝
+Cfg.owners = {}
+for _, n in ipairs({ "Redbell1234", "Dogenurgos" }) do Cfg.owners[lc(n)] = true end
+function Cfg.isOwner(n) return n ~= nil and Cfg.owners[lc(n)] == true end
+Cfg.me = Cfg.isOwner(plr.Name)
+Cfg.slow = 0
+Cfg.blacklist = {}
+Cfg.blSet = {}
+Cfg.lastSend = 0
+Cfg.purgeTs = 0
+Cfg.del, Cfg.delSet = {}, {}
+Cfg.roster, Cfg.rosterSet = {}, {}
+
+function Cfg.blocked(n) return n ~= nil and Cfg.blSet[lc(n)] == true end
+function Cfg.now() return (os.time and os.time() or math.floor(os.clock())) end
+
+function Cfg.track(name, uid)
+	if type(name) ~= "string" or #name == 0 then return end
+	local key = lc(name)
+	local rec = Cfg.rosterSet[key]
+	if rec then
+		if uid then rec.uid = uid end
+		rec.t = Cfg.now()
+		Pan.rosterDirty = true
+		return
+	end
+	rec = { u = name, uid = uid, t = Cfg.now() }
+	Cfg.rosterSet[key] = rec
+	Cfg.roster[#Cfg.roster + 1] = rec
+	while #Cfg.roster > 60 do
+		local old = table.remove(Cfg.roster, 1)
+		if old then Cfg.rosterSet[lc(old.u)] = nil end
+	end
+	Pan.rosterDirty = true
+end
+
+function Cfg.toggleBlacklist(name)
+	if type(name) ~= "string" or #name == 0 then return end
+	local key = lc(name)
+	if Cfg.blSet[key] then
+		for k, n in ipairs(Cfg.blacklist) do
+			if lc(n) == key then table.remove(Cfg.blacklist, k); break end
+		end
+		Cfg.blSet[key] = nil
+		H.flash("Unblocked " .. name, UI.C.OKC)
+	else
+		Cfg.blacklist[#Cfg.blacklist + 1] = name
+		Cfg.blSet[key] = true
+		H.flash("Blacklisted " .. name, UI.C.OKC)
+	end
+	Net.broadcast()
+	Pan.refresh()
+end
+
+function Cfg.mergeDel(list)
+	if type(list) ~= "table" then return end
+	local changed = false
+	for _, id in ipairs(list) do
+		if type(id) == "string" and #id > 0 and not Cfg.delSet[id] then
+			Cfg.delSet[id] = true
+			Cfg.del[#Cfg.del + 1] = id
+			changed = true
+		end
+	end
+	while #Cfg.del > 400 do Cfg.delSet[table.remove(Cfg.del, 1)] = nil end
+	if not changed then return end
+	for i = #Mem.history, 1, -1 do
+		local e = Mem.history[i]
+		if e.id and Cfg.delSet[e.id] then
+			if e.row then e.row:Destroy(); e.row = nil end
+			Mem.byId[e.id] = nil
+			table.remove(Mem.history, i)
+			if i < V.next then V.next = V.next - 1 end
+		end
+	end
+	Mem.save()
+end
+
+function Cfg.set(slow, bl, purge)
+	Cfg.slow = math.max(0, math.floor(tonumber(slow) or 0))
+	Cfg.blacklist = (type(bl) == "table") and bl or {}
+	Cfg.blSet = {}
+	for _, n in ipairs(Cfg.blacklist) do Cfg.blSet[lc(n)] = true end
+	Pan.refresh()
+	H.status()
+	if purge then
+		local p = tonumber(purge)
+		if p and p > Cfg.purgeTs and H.purge then
+			H.purge(p)
+			H.flash("Chat purged by owner", UI.C.OKC)
+		end
+	end
+end
+
+-- ╔══════════════════════════════════════════════════════════╗
+-- ║  CHAT MEMORY                                             ║
+-- ╚══════════════════════════════════════════════════════════╝
+Mem.path = "nebula_chat_history.json"
+Mem.history = {}
+Mem.byId = {}
+Mem.pending = false
+Mem.cap = 2000
+
+-- same gate as the live path, so junk rows already sitting in the
+-- saved file do not come back after a reload
+function Mem.norm(m)
+	if type(m) ~= "table" then return nil end
+	local u = Net.cleanUser(m.u)
+	if not u then return nil end
+	local e = {
+		id  = (type(m.id) == "string" and #m.id > 0) and m.id or nil,
+		u   = u,
+		uid = tonumber(m.uid),
+		g   = Net.cleanText(m.g),
+		m   = Net.cleanText(m.m),
+		img = Net.cleanImg(m.img),
+		t   = tonumber(m.t) or 0,
+	}
+	if #e.g == 0 or #e.g > 60 then e.g = "?" end
+	if #e.m == 0 and not e.img then return nil end
+	if type(m.r) == "table" then
+		local ru = Net.cleanUser(m.r.u)
+		if ru then
+			e.r = { id = type(m.r.id) == "string" and m.r.id or nil, u = ru,
+				m = Net.cleanText(m.r.m) }
+		end
+	end
+	if e.img then
+		e.iw = tonumber(m.w) or 200
+		e.ih = tonumber(m.h) or 150
+	end
+	return e
+end
+
+function Mem.snapshot()
+	local out = { v = 4, since = Net.sinceTab, purge = Cfg.purgeTs, del = Cfg.del, msgs = {} }
+	local start = math.max(1, #Mem.history - (Mem.cap - 1))
+	for i = start, #Mem.history do
+		local e = Mem.history[i]
+		out.msgs[#out.msgs + 1] = { id = e.id, u = e.u, uid = e.uid, g = e.g,
+			m = e.m, img = e.img, w = e.iw, h = e.ih, t = e.t, r = e.r }
+	end
+	return out
+end
+
+function Mem.saveNow()
+	if not FS.ok then return end
+	pcall(function() FS.write(Mem.path, Http:JSONEncode(Mem.snapshot())) end)
+end
+_G.__NebulaChatSave = Mem.saveNow
+
+function Mem.save()
+	if Mem.pending then return end
+	Mem.pending = true
+	task.delay(1.5, function()
+		Mem.pending = false
+		Mem.saveNow()
+	end)
+end
+
+function Mem.load()
+	if not FS.ok then return end
+	local ok, raw = pcall(FS.read, Mem.path)
+	if not ok or type(raw) ~= "string" or #raw == 0 then return end
+	local okd, data = pcall(Http.JSONDecode, Http, raw)
+	if not okd or type(data) ~= "table" then return end
+	if type(data.since) == "table" then
+		for i = 1, Net.SHARDS do
+			local s = data.since[i] or data.since[tostring(i)]
+			if type(s) == "string" and #s > 0 then Net.sinceTab[i] = s end
+		end
+	elseif type(data.since) == "string" and #data.since > 0 then
+		for i = 1, Net.SHARDS do Net.sinceTab[i] = data.since end
+	end
+	Cfg.purgeTs = tonumber(data.purge) or 0
+	if type(data.del) == "table" then
+		for _, id in ipairs(data.del) do
+			if type(id) == "string" and #id > 0 then
+				Cfg.del[#Cfg.del + 1] = id
+				Cfg.delSet[id] = true
+			end
+		end
+	end
+	local haveId = {}
+	if type(data.msgs) == "table" then
+		for _, rawMsg in ipairs(data.msgs) do
+			local e = Mem.norm(rawMsg)
+			if e and (e.t == 0 or e.t > Cfg.purgeTs) and not (e.id and Cfg.delSet[e.id]) then
+				if not (e.id and haveId[e.id]) then
+					if e.id then haveId[e.id] = true; Net.seen[e.id] = true end
+					Mem.history[#Mem.history + 1] = e
+				end
+			end
+		end
+	end
+	table.sort(Mem.history, function(a, b) return (a.t or 0) < (b.t or 0) end)
+	while #Mem.history > Mem.cap do table.remove(Mem.history, 1) end
+	for _, e in ipairs(Mem.history) do if e.id then Mem.byId[e.id] = e end end
+end
+Mem.load()
+
+V.next = 1
+V.rendering = false
+V.ready = false
+V.wantSnap = true
+
+function V.jump(id)
+	local e = id and Mem.byId[id]
+	if not e or not e.row or not e.row.Parent then
+		H.flash("Original message is gone", UI.C.DIM)
+		return
+	end
+	local y = (e.row.AbsolutePosition.Y - UI.chat.AbsolutePosition.Y) + UI.chat.CanvasPosition.Y - 30
+	UI.chat.CanvasPosition = Vector2.new(0, math.max(0, y))
+	local inner = nil
+	for _, c in ipairs(e.row:GetChildren()) do
+		if c:IsA("Frame") and c:FindFirstChildOfClass("UIListLayout") then inner = c; break end
+	end
+	if inner then
+		local orig = inner.BackgroundColor3
+		inner.BackgroundColor3 = UI.C.WARN
+		task.delay(.35, function()
+			if inner.Parent then inner.BackgroundColor3 = orig end
+		end)
+	end
+end
+
+function V.build(e)
+	local mine = (e.u == plr.Name)
+	local who = mine and plr.Name or e.u
+	local gname = e.g or "?"
+	local text = e.m or ""
+	local owner = Cfg.isOwner(who)
+	local animate = e.anim and true or false
+	local sidePad = UI.AVATAR + 12 + UI.ACT_W
+
+	local row = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1,
+		AutomaticSize = Enum.AutomaticSize.Y }, UI.holder)
+
+	local avWrap = mk("TextButton", {
+		Size = UDim2.fromOffset(UI.AVATAR, UI.AVATAR),
+		Position = mine and UDim2.new(1, 0, 0, 0) or UDim2.new(0, 0, 0, 0),
+		AnchorPoint = mine and Vector2.new(1, 0) or Vector2.new(0, 0),
+		BackgroundColor3 = Color3.fromRGB(28, 26, 44), BorderSizePixel = 0,
+		AutoButtonColor = false, Text = "", ZIndex = 3 }, row)
+	mk("UICorner", { CornerRadius = UDim.new(1, 0) }, avWrap)
+	mk("UIStroke", { Thickness = 1.5, Color = owner and UI.C.WARN or Color3.fromRGB(96, 86, 150),
+		Transparency = owner and 0.05 or 0.4 }, avWrap)
+	local av = mk("ImageLabel", {
+		Size = UDim2.new(1, -4, 1, -4), Position = UDim2.new(0, 2, 0, 2),
+		BackgroundColor3 = Color3.fromRGB(45, 42, 66), BorderSizePixel = 0,
+		Image = "", ImageTransparency = 1, ZIndex = 4 }, avWrap)
+	mk("UICorner", { CornerRadius = UDim.new(1, 0) }, av)
+	UI.loadAvatar(av, e.uid, who)
+	avWrap.MouseButton1Click:Connect(function() Card.show(who, e.uid) end)
+
+	local acts = mk("Frame", { Size = UDim2.fromOffset(UI.ACT_W, 18),
+		Position = mine and UDim2.new(0, 0, 0, 2) or UDim2.new(1, 0, 0, 2),
+		AnchorPoint = mine and Vector2.new(0, 0) or Vector2.new(1, 0),
+		BackgroundTransparency = 1, ZIndex = 5 }, row)
+	mk("UIListLayout", { FillDirection = Enum.FillDirection.Vertical, Padding = UDim.new(0, 4) }, acts)
+
+	local function actBtn(txt, ts, col, fn)
+		local b = mk("TextButton", { Size = UDim2.fromOffset(18, 18), BackgroundColor3 = col,
+			BackgroundTransparency = .55, BorderSizePixel = 0, AutoButtonColor = false,
+			Font = Enum.Font.GothamBold, Text = txt, TextSize = ts,
+			TextColor3 = Color3.fromRGB(226, 222, 244), ZIndex = 6 }, acts)
+		mk("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+		b.MouseButton1Click:Connect(fn)
+		return b
+	end
+	actBtn("↩", 12, Color3.fromRGB(60, 56, 92), function() T.setReply(e) end)
+	if mine or Cfg.me then
+		actBtn("×", 12, Color3.fromRGB(120, 56, 66), function() H.deleteEntry(e) end)
+	end
+
+	local inner = mk("Frame", { Size = UDim2.new(1, -sidePad, 0, 0),
+		Position = mine and UDim2.new(1, -(UI.AVATAR + UI.AVGAP), 0, 0) or UDim2.new(0, UI.AVATAR + UI.AVGAP, 0, 0),
+		AnchorPoint = mine and Vector2.new(1, 0) or Vector2.new(0, 0),
+		BackgroundColor3 = mine and Color3.fromRGB(70, 42, 140) or Color3.fromRGB(255, 255, 255),
+		BackgroundTransparency = mine and 0 or .94, BorderSizePixel = 0,
+		AutomaticSize = Enum.AutomaticSize.Y, ZIndex = 2 }, row)
+	mk("UICorner", { CornerRadius = UDim.new(0, 12) }, inner)
+	mk("UIListLayout", { Padding = UDim.new(0, 3) }, inner)
+	mk("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 7),
+		PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, inner)
+
+	local nameText = string.upper(who) .. "  ·  " .. string.upper(gname) .. (owner and "  ·  👑 OWNER" or "")
+	local nameLabel = mk("TextLabel", { Size = UDim2.new(1, 0, 0, 11), BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold, Text = "", RichText = owner, TextSize = 9,
+		TextColor3 = mine and Color3.fromRGB(216, 207, 251) or Color3.fromRGB(139, 134, 168),
+		TextXAlignment = mine and Enum.TextXAlignment.Right or Enum.TextXAlignment.Left }, inner)
+	if owner then
+		local base = esc(nameText)
+		UI.rainbowLabels[#UI.rainbowLabels + 1] = { label = nameLabel, text = base, phase = math.random() }
+		nameLabel.Text = UI.rainbow(base, math.random())
+	else
+		nameLabel.Text = nameText
+	end
+
+	if e.r then
+		local qb = mk("TextButton", { Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+			BackgroundTransparency = .82, BorderSizePixel = 0, AutoButtonColor = false, Text = "",
+			ClipsDescendants = true, ZIndex = 3 }, inner)
+		mk("UICorner", { CornerRadius = UDim.new(0, 7) }, qb)
+		mk("Frame", { Size = UDim2.new(0, 2, 1, 0), BackgroundColor3 = UI.C.A, BorderSizePixel = 0, ZIndex = 4 }, qb)
+		mk("TextLabel", { Size = UDim2.new(1, -14, 0, 10), Position = UDim2.fromOffset(8, 3),
+			BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = string.upper(e.r.u or "?"),
+			TextSize = 8.5, TextColor3 = Color3.fromRGB(186, 176, 235),
+			TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 4 }, qb)
+		mk("TextLabel", { Size = UDim2.new(1, -14, 0, 11), Position = UDim2.fromOffset(8, 13),
+			BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+			Text = (e.r.m and #e.r.m > 0) and e.r.m or "[gif]", TextSize = 9.5,
+			TextColor3 = Color3.fromRGB(196, 192, 214), TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 4 }, qb)
+		qb.MouseButton1Click:Connect(function() V.jump(e.r.id) end)
+	end
+
+	if #text > 0 then
+		local tl = mk("TextLabel", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+			Text = "", RichText = owner, TextSize = 12.5,
+			TextColor3 = Color3.fromRGB(231, 229, 242),
+			TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+			AutomaticSize = Enum.AutomaticSize.Y }, inner)
+		if owner then
+			local base = esc(text)
+			UI.rainbowLabels[#UI.rainbowLabels + 1] = { label = tl, text = base, phase = math.random() }
+			tl.Text = UI.rainbow(base, math.random())
+		else
+			tl.Text = text
+		end
+	end
+
+	if e.img then
+		local mw, mh = UI.isTouch and 170 or 220, 170
+		local iw, ih = e.iw or 200, e.ih or 150
+		local s = math.min(mw / iw, mh / ih, 1)
+		local im = mk("ImageLabel", { Size = UDim2.fromOffset(iw * s, ih * s),
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255), BackgroundTransparency = .92,
+			BorderSizePixel = 0, ScaleType = Enum.ScaleType.Fit }, inner)
+		mk("UICorner", { CornerRadius = UDim.new(0, 8) }, im)
+		Q.attach(im, { e.img }, false)
+	end
+
+	if animate then
+		inner.BackgroundTransparency = 1
+		inner.Size = UDim2.new(1, -(sidePad + 10), 0, 0)
+		tw(inner, .45, { BackgroundTransparency = mine and 0 or .94,
+			Size = UDim2.new(1, -sidePad, 0, 0) }, Enum.EasingStyle.Back)
+	else
+		inner.BackgroundTransparency = mine and 0 or .94
+		inner.Size = UDim2.new(1, -sidePad, 0, 0)
+	end
+	return row
+end
+
+function V.render()
+	if V.rendering then return end
+	V.rendering = true
+	local n = 0
+	while V.next <= #Mem.history do
+		local e = Mem.history[V.next]
+		V.next = V.next + 1
+		if not e.row then
+			e.row = V.build(e)
+			e.anim = false
+		end
+		n = n + 1
+		if n >= 60 then
+			n = 0
+			task.spawn(function()
+				task.wait()
+				V.rendering = false
+				V.render()
+			end)
+			return
+		end
+	end
+	V.rendering = false
+	V.ready = true
+	if V.wantSnap then
+		V.wantSnap = false
+		V.snap()
+	end
+end
+
+function V.atBottom()
+	return (UI.chat.AbsoluteCanvasSize.Y - UI.chat.CanvasPosition.Y - UI.chat.AbsoluteWindowSize.Y) <= 90
+end
+
+function V.snap()
+	UI.chat.CanvasPosition = Vector2.new(0, math.max(0, UI.chat.AbsoluteCanvasSize.Y - UI.chat.AbsoluteWindowSize.Y))
+end
+
+function V.scroll(animate)
+	local t = math.max(0, UI.chat.AbsoluteCanvasSize.Y - UI.chat.AbsoluteWindowSize.Y)
+	if animate then
+		tw(UI.chat, .25, { CanvasPosition = Vector2.new(0, t) }, Enum.EasingStyle.Quad)
+	else
+		UI.chat.CanvasPosition = Vector2.new(0, t)
+	end
+end
+
+function V.push(e, animate)
+	local stick = V.ready and V.atBottom()
+	e.anim = animate and stick or false
+	Mem.add(e)
+	if stick then V.scroll(animate) end
+end
+
+function Mem.add(e)
+	e.t = e.t or Cfg.now()
+	Mem.history[#Mem.history + 1] = e
+	if e.id then
+		Net.markSeen(e.id)
+		Mem.byId[e.id] = e
+	end
+	while #Mem.history > Mem.cap do
+		local old = table.remove(Mem.history, 1)
+		if old then
+			if old.id then Mem.byId[old.id] = nil end
+			if old.row then old.row:Destroy(); old.row = nil end
+		end
+		if V.next > 1 then V.next = V.next - 1 end
+	end
+	V.render()
+	Mem.save()
+end
+
+function H.deleteEntry(e)
+	if not e then return end
+	if e.u ~= plr.Name and not Cfg.me then
+		H.flash("Only " .. tostring(e.u) .. " or an owner can delete this", UI.C.WARN)
+		return
+	end
+	local id = e.id
+	if id then
+		if not Cfg.delSet[id] then
+			Cfg.delSet[id] = true
+			Cfg.del[#Cfg.del + 1] = id
+		end
+		while #Cfg.del > 400 do Cfg.delSet[table.remove(Cfg.del, 1)] = nil end
+		Mem.byId[id] = nil
+	end
+	for i = #Mem.history, 1, -1 do
+		if Mem.history[i] == e then
+			if e.row then e.row:Destroy(); e.row = nil end
+			table.remove(Mem.history, i)
+			if i < V.next then V.next = V.next - 1 end
+			break
+		end
+	end
+	if T.replyTo and id and T.replyTo.id == id then T.clearReply() end
+	Mem.saveNow()
+	if id then Net.delBroadcast() end
+	H.flash("Message deleted", UI.C.OKC)
+end
+
+function H.purge(ts)
+	ts = tonumber(ts) or Cfg.now()
+	if ts > Cfg.purgeTs then Cfg.purgeTs = ts end
+	Mem.history = {}
+	Mem.byId = {}
+	Mem.saveNow()
+	pcall(function()
+		for _, c in ipairs(UI.holder:GetChildren()) do
+			if c:IsA("GuiObject") then c:Destroy() end
+		end
+		V.next = 1
+		V.ready = false
+		V.wantSnap = true
+		V.render()
+	end)
+end
+
+task.spawn(function()
+	UI.laidOut(UI.chat, 3)
+	V.wantSnap = true
+	V.render()
+end)
+
+-- ╔══════════════════════════════════════════════════════════╗
+-- ║  PANELS                                                  ║
+-- ╚══════════════════════════════════════════════════════════╝
+Pan.gifsOpen, Pan.ownerOpen = false, false
+Pan.purgeArmed, Pan.purgeTok = false, 0
+Pan.rosterDirty = false
+Pan.loaded = false
+Pan.target = "global"
+Pan.kSrc = "giphy"
+
+do
+	local function ptab(txt, ord, onClick)
+		local b = mk("TextButton", { Size = UDim2.new(.5, -3, 1, 0), BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			BackgroundTransparency = .96, BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBold,
+			Text = txt, TextSize = 10.5, TextColor3 = Color3.fromRGB(157, 152, 184), LayoutOrder = ord, ZIndex = 62 }, UI.pTabs)
+		mk("UICorner", { CornerRadius = UDim.new(0, 9) }, b)
+		b.MouseButton1Click:Connect(onClick)
+		return b
+	end
+
+	Pan.gSec = mk("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 62 }, UI.pContent)
+	Pan.gRow = mk("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1, ZIndex = 63 }, Pan.gSec)
+
+	Pan.gSearch = mk("TextBox", { Size = UDim2.new(1, -76, 1, 0), BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+		BackgroundTransparency = .95, BorderSizePixel = 0, Font = Enum.Font.Gotham, Text = "",
+		PlaceholderText = "search gifs...", PlaceholderColor3 = Color3.fromRGB(110, 110, 138),
+		TextSize = 11.5, TextColor3 = UI.C.FG, TextXAlignment = Enum.TextXAlignment.Left,
+		ClearTextOnFocus = false, ZIndex = 64 }, Pan.gRow)
+	mk("UICorner", { CornerRadius = UDim.new(0, 10) }, Pan.gSearch)
+	mk("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, Pan.gSearch)
+
+	local function smallBtn(txt, x)
+		local b = mk("TextButton", { Size = UDim2.fromOffset(34, 30), Position = UDim2.new(1, x, 0, 0),
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255), BackgroundTransparency = .95, BorderSizePixel = 0,
+			AutoButtonColor = false, Font = Enum.Font.GothamBold, Text = txt, TextSize = 12,
+			TextColor3 = Color3.fromRGB(157, 152, 184), ZIndex = 64 }, Pan.gRow)
+		mk("UICorner", { CornerRadius = UDim.new(0, 10) }, b)
+		return b
+	end
+
+	Pan.gRef, Pan.gMore = smallBtn("", -72), smallBtn("+", -36)
+	Pan.gMore.Visible = false
+
+	do
+		local col = Color3.fromRGB(170, 165, 200)
+		local ring = mk("Frame", { Size = UDim2.fromOffset(17, 17), Position = UDim2.new(.5, 0, .5, 0),
+			AnchorPoint = Vector2.new(.5, .5), BackgroundTransparency = 1, ZIndex = 65 }, Pan.gRef)
+		mk("UICorner", { CornerRadius = UDim.new(1, 0) }, ring)
+		mk("UIStroke", { Thickness = 2.1, Color = col }, ring)
+		mk("Frame", { Size = UDim2.fromOffset(10, 9), Position = UDim2.new(.5, 4, .5, -9),
+			BackgroundColor3 = Color3.fromRGB(30, 29, 41), BorderSizePixel = 0, ZIndex = 66 }, Pan.gRef)
+		local head = mk("TextLabel", { Size = UDim2.fromOffset(12, 12), Position = UDim2.new(.5, 5, .5, -7),
+			AnchorPoint = Vector2.new(.5, .5), BackgroundTransparency = 1, Font = Enum.Font.GothamBlack,
+			Text = "▶", TextSize = 8, TextColor3 = col, ZIndex = 67 }, Pan.gRef)
+		head.Rotation = -50
+	end
+
+	Pan.dbg = mk("TextLabel", { Size = UDim2.new(1, 0, 0, 24), Position = UDim2.fromOffset(0, 34),
+		BackgroundTransparency = 1, Font = Enum.Font.Code, Text = "", TextSize = 8,
+		TextColor3 = Color3.fromRGB(140, 134, 170), TextXAlignment = Enum.TextXAlignment.Left,
+		TextWrapped = true, ZIndex = 63 }, Pan.gSec)
+
+	Pan.gStatus = mk("TextLabel", { Size = UDim2.new(1, 0, 0, 16), Position = UDim2.fromOffset(0, 72),
+		BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "", TextSize = 10.5,
+		TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 63 }, Pan.gSec)
+
+	-- key row: only shown when every source failed, so a dead key
+	-- can be replaced without touching the script
+	Pan.kRow = mk("Frame", { Size = UDim2.new(1, 0, 0, 30), Position = UDim2.fromOffset(0, 90),
+		BackgroundTransparency = 1, Visible = false, ZIndex = 63 }, Pan.gSec)
+
+	Pan.kSrcBtn = mk("TextButton", { Size = UDim2.fromOffset(58, 30), BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+		BackgroundTransparency = .95, BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBlack,
+		Text = "GIPHY", TextSize = 9, TextColor3 = Color3.fromRGB(157, 152, 184), ZIndex = 64 }, Pan.kRow)
+	mk("UICorner", { CornerRadius = UDim.new(0, 10) }, Pan.kSrcBtn)
+
+	Pan.kBox = mk("TextBox", { Size = UDim2.new(1, -122, 1, 0), Position = UDim2.fromOffset(64, 0),
+		BackgroundColor3 = Color3.fromRGB(255, 255, 255), BackgroundTransparency = .95, BorderSizePixel = 0,
+		Font = Enum.Font.Code, Text = "", PlaceholderText = "paste a free api key",
+		PlaceholderColor3 = Color3.fromRGB(110, 110, 138), TextSize = 10, TextColor3 = UI.C.FG,
+		TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, ZIndex = 64 }, Pan.kRow)
+	mk("UICorner", { CornerRadius = UDim.new(0, 10) }, Pan.kBox)
+	mk("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, Pan.kBox)
+
+	Pan.kSave = mk("TextButton", { Size = UDim2.fromOffset(52, 30), Position = UDim2.new(1, -52, 0, 0),
+		BackgroundColor3 = UI.C.A, BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBlack,
+		Text = "SAVE", TextSize = 9.5, TextColor3 = Color3.new(1, 1, 1), ZIndex = 64 }, Pan.kRow)
+	mk("UICorner", { CornerRadius = UDim.new(0, 10) }, Pan.kSave)
+
+	Pan.gScroll = mk("ScrollingFrame", { Size = UDim2.new(1, 0, 1, -62), Position = UDim2.fromOffset(0, 60),
+		BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+		ScrollBarImageColor3 = Color3.fromRGB(70, 70, 100),
+		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ZIndex = 63 }, Pan.gSec)
+	Pan.gHolder = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.Y }, Pan.gScroll)
+	Pan.gGrid = mk("UIGridLayout", { CellSize = UDim2.fromOffset(100, 76), CellPadding = UDim2.fromOffset(6, 6) }, Pan.gHolder)
+
+	function Pan.keyLayout()
+		if Pan.kRow.Visible then
+			Pan.gScroll.Position = UDim2.fromOffset(0, 126)
+			Pan.gScroll.Size = UDim2.new(1, 0, 1, -128)
+		else
+			Pan.gScroll.Position = UDim2.fromOffset(0, 60)
+			Pan.gScroll.Size = UDim2.new(1, 0, 1, -62)
+		end
+	end
+
+	Pan.eSec = mk("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false, ZIndex = 62 }, UI.pContent)
+	Pan.eScroll = mk("ScrollingFrame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
+		ScrollBarThickness = 3, ScrollBarImageColor3 = Color3.fromRGB(70, 70, 100),
+		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ZIndex = 63 }, Pan.eSec)
+	Pan.eHolder = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.Y }, Pan.eScroll)
+	Pan.eGrid = mk("UIGridLayout", { CellSize = UDim2.fromOffset(36, 36), CellPadding = UDim2.fromOffset(4, 4) }, Pan.eHolder)
+	Pan.eButtons = {}
+
+	function Pan.reflow()
+		local w = Pan.eScroll.AbsoluteSize.X
+		if w < 8 then return end
+		local cols = math.max(5, math.floor((w + 4) / 40))
+		local cell = math.floor((w - (cols - 1) * 4) / cols)
+		Pan.eGrid.CellSize = UDim2.fromOffset(cell, cell)
+		for _, b in ipairs(Pan.eButtons) do b.Size = UDim2.fromOffset(cell, cell) end
+	end
+
+	for _, e in ipairs(UI.emojiList) do
+		local b = mk("TextButton", { Size = UDim2.fromOffset(36, 36), BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			BackgroundTransparency = .95, BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.Gotham,
+			Text = e, TextSize = 18, ZIndex = 64 }, Pan.eHolder)
+		mk("UICorner", { CornerRadius = UDim.new(0, 9) }, b)
+		Pan.eButtons[#Pan.eButtons + 1] = b
+		b.MouseButton1Click:Connect(function()
+			local box = Pan.box or UI.box
+			box.Text = utf8Cut(box.Text .. e, 200)
+			box.CursorPosition = #box.Text + 1
+		end)
+	end
+	track(Pan.eScroll:GetPropertyChangedSignal("AbsoluteSize"):Connect(Pan.reflow))
+	task.spawn(function() task.wait(); UI.laidOut(Pan.eScroll); Pan.reflow() end)
+
+	task.spawn(function()
+		while running and Pan.dbg.Parent do
+			Pan.dbg.Text = string.format("pin:%s ready:%s link:%s lanes:%d/%d | file:%s edit:%s | src:%s | gif:%d/%d/%d/%d | msgs:%d del:%d drop:%d",
+				Net.host, Net.hostReady and "Y" or "N",
+				Net.live and "WS" or (Net.online and "poll" or "down"), tonumber(Net.presenceN) or 1,
+				(function() local n = 0 for _ in pairs(Net.socks) do n = n + 1 end return n end)(),
+				FS.probeFile and "Y" or "N", FS.probeEdit and "Y" or "N",
+				API.active.source or "-", Q.stats.edit, Q.stats.ok, Q.stats.hit, Q.stats.url,
+				#Mem.history, #Cfg.del, Net.dropped)
+			task.wait(.5)
+		end
+	end)
+
+	function Pan.show(which)
+		Pan.gSec.Visible = which == "gif"
+		Pan.eSec.Visible = which == "emoji"
+		tw(Pan.gTab, .2, { BackgroundTransparency = which == "gif" and .5 or .96 })
+		tw(Pan.eTab, .2, { BackgroundTransparency = which == "emoji" and .5 or .96 })
+		if which == "gif" and not Pan.loaded then Pan.load("") end
+		if which == "emoji" then Pan.reflow() end
+	end
+	Pan.gTab = ptab("GIFs", 1, function() Pan.show("gif") end)
+	Pan.eTab = ptab("Emoji", 2, function() Pan.show("emoji") end)
+
+	function Pan.load(query, append)
+		Net.searchToken = Net.searchToken + 1
+		local token = Net.searchToken
+		if not append then
+			Net.gifsOffset = 0
+			for _, c in ipairs(Pan.gHolder:GetChildren()) do
+				if c:IsA("GuiObject") then c:Destroy() end
+			end
+		end
+		Pan.gStatus.Visible = true
+		Pan.gStatus.Text = "loading…"
+
+		task.spawn(function()
+			local width = UI.laidOut(Pan.gScroll, 2) - 6
+			if width < 120 then width = math.max(160, UI.root.AbsoluteSize.X - 44) end
+			if not API.done then
+				local t0 = os.clock()
+				while not API.done and os.clock() - t0 < 10 do task.wait(.1) end
+			end
+			if token ~= Net.searchToken then return end
+			if not API.active.source then
+				Pan.kRow.Visible = true
+				Pan.keyLayout()
+				Pan.gStatus.Text = "no working key — paste one below"
+				return
+			end
+			Pan.kRow.Visible = false
+			Pan.keyLayout()
+			Pan.gSearch.PlaceholderText = API.active.source == "klipy" and "Search KLIPY" or "search gifs..."
+			local list, err = API.search(query, Net.gifsOffset)
+			if token ~= Net.searchToken then return end
+			if not list then Pan.gStatus.Text = "search failed — " .. tostring(err) .. " (tap refresh)"; return end
+			if #list == 0 then Pan.gStatus.Text = "no results"; return end
+
+			Pan.gStatus.Visible = false
+			Pan.loaded = true
+			Net.gifsOffset = Net.gifsOffset + #list
+			Pan.gMore.Visible = true
+
+			local cellW = math.max(64, math.floor((width - (UI.COLS - 1) * 6) / UI.COLS))
+			local cellH = math.floor(cellW * 0.76)
+			Pan.gGrid.CellSize = UDim2.fromOffset(cellW, cellH)
+
+			for _, entry in ipairs(list) do
+				local tile = mk("ImageButton", { Size = UDim2.fromOffset(cellW, cellH),
+					BackgroundColor3 = Color3.fromRGB(40, 35, 62), BorderSizePixel = 0, ScaleType = Enum.ScaleType.Crop,
+					AutoButtonColor = false, Active = true, ZIndex = 64 }, Pan.gHolder)
+				mk("UICorner", { CornerRadius = UDim.new(0, 9) }, tile)
+				mk("TextLabel", { Size = UDim2.new(1, -8, 0, 11), Position = UDim2.new(0, 4, 1, -13),
+					BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = entry.name, TextSize = 9,
+					TextColor3 = Color3.fromRGB(245, 243, 255), TextTruncate = Enum.TextTruncate.AtEnd,
+					TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 66 }, tile)
+				local urls = {}
+				for _, v in ipairs(entry.urls) do urls[#urls + 1] = v.url end
+				Q.attach(tile, urls, true)
+				tile.MouseButton1Click:Connect(function()
+					local first = entry.urls[1]
+					Pan.emit("", first.url, first.w, first.h)
+					Pan.close()
+				end)
+			end
+		end)
+	end
+
+	Pan.kSrcBtn.MouseButton1Click:Connect(function()
+		Pan.kSrc = (Pan.kSrc == "giphy") and "klipy" or "giphy"
+		Pan.kSrcBtn.Text = string.upper(Pan.kSrc)
+		Pan.kBox.PlaceholderText = Pan.kSrc == "klipy" and "paste a klipy key" or "paste a giphy key"
+	end)
+
+	function Pan.saveKey()
+		local key = Pan.kBox.Text:gsub("%s", "")
+		if #key < 8 then H.flash("Key looks too short", UI.C.BADC); return end
+		API.addKey(Pan.kSrc, key)
+		Pan.kBox.Text = ""
+		Pan.gStatus.Text = "checking key…"
+		API.done = false
+		task.spawn(function()
+			API.probe()
+			Pan.load(Pan.gSearch.Text)
+		end)
+	end
+	Pan.kSave.MouseButton1Click:Connect(Pan.saveKey)
+	Pan.kBox.FocusLost:Connect(function(enter) if enter then Pan.saveKey() end end)
+
+	local debounce
+	Pan.gSearch:GetPropertyChangedSignal("Text"):Connect(function()
+		if debounce then pcall(task.cancel, debounce) end
+		debounce = task.delay(.45, function() Pan.load(Pan.gSearch.Text) end)
+	end)
+	Pan.gSearch.FocusLost:Connect(function() Pan.load(Pan.gSearch.Text) end)
+	Pan.gRef.MouseButton1Click:Connect(function()
+		if not API.active.source then API.done = false; task.spawn(API.probe) end
+		Pan.load(Pan.gSearch.Text)
+	end)
+	Pan.gMore.MouseButton1Click:Connect(function() Pan.load(Pan.gSearch.Text, true) end)
+
+	-- picker stays inside the chat chamber: bottom pinned above the
+	-- composer, height capped so the top never reaches the title bar
+	function Pan.place()
+		UI.panel.AnchorPoint = Vector2.new(0, 1)
+		local avail
+		if Pan.target == "dm" then
+			UI.panel.Parent = DM.win
+			avail = (DM.curH or DM.H) - 48 - 6 - 12
+			UI.panel.Size = UDim2.new(1, -20, 0, math.max(110, math.min(UI.PANEL_H, avail)))
+			UI.panel.Position = UDim2.new(0, 10, 1, -(48 + 6))
+		elseif Pan.target == "grp" then
+			UI.panel.Parent = Grp.win
+			avail = (Grp.curH or Grp.H) - 48 - 6 - 12
+			UI.panel.Size = UDim2.new(1, -20, 0, math.max(110, math.min(UI.PANEL_H, avail)))
+			UI.panel.Position = UDim2.new(0, 10, 1, -(48 + 6))
+		else
+			UI.panel.Parent = UI.cg
+			avail = UI.BASE_H - 44 - UI.INBAR_H - 16
+			UI.panel.Size = UDim2.new(1, -20, 0, math.max(110, math.min(UI.PANEL_H, avail)))
+			UI.panel.Position = UDim2.new(0, 10, 1, -(UI.INBAR_H + 8))
+		end
+		if Pan.eSec.Visible then task.spawn(function() task.wait(); Pan.reflow() end) end
+	end
+
+	function Pan.close()
+		if not Pan.gifsOpen then return end
+		Pan.gifsOpen = false
+		tw(UI.panel, .18, { BackgroundTransparency = 1 })
+		task.delay(.2, function() if not Pan.gifsOpen then UI.panel.Visible = false end end)
+	end
+
+	function Pan.open(which, target)
+		target = target or "global"
+		if Pan.ownerOpen then Pan.closeOwner() end
+		Pan.target = target
+		if target == "dm" then
+			Pan.box, Pan.emit = DM.box, DM.send
+		elseif target == "grp" then
+			Pan.box, Pan.emit = Grp.box, Grp.send
+		else
+			Pan.box, Pan.emit = UI.box, T.publish
+		end
+		Pan.place()
+		if Pan.gifsOpen and Pan.target == target
+		and ((which == "gif" and Pan.gSec.Visible) or (which == "emoji" and Pan.eSec.Visible)) then
+			Pan.close(); return
+		end
+		Pan.gifsOpen = true
+		UI.panel.Visible = true
+		UI.panel.BackgroundTransparency = 1
+		tw(UI.panel, .22, { BackgroundTransparency = 0 })
+		Pan.show(which)
+	end
+
+	Pan.oPanel = mk("Frame", { Size = UDim2.new(1, -24, 1, -56), Position = UDim2.new(0, 12, 0, 50),
+		BackgroundColor3 = Color3.fromRGB(18, 17, 30), BorderSizePixel = 0, Visible = false, ZIndex = 30 }, UI.cg)
+	mk("UICorner", { CornerRadius = UDim.new(0, 14) }, Pan.oPanel)
+	mk("UIPadding", { PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 12), PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }, Pan.oPanel)
+
+	mk("TextLabel", { Size = UDim2.new(1, -30, 0, 18), BackgroundTransparency = 1, Font = Enum.Font.GothamBlack,
+		Text = "OWNER CONTROLS", TextSize = 11, TextColor3 = Color3.fromRGB(216, 207, 251),
+		TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31 }, Pan.oPanel)
+	local oClose = mk("TextButton", { Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, 0, 0, -2),
+		BackgroundColor3 = Color3.fromRGB(38, 38, 56), BorderSizePixel = 0, AutoButtonColor = false,
+		Font = Enum.Font.GothamBold, Text = "×", TextSize = 12, TextColor3 = UI.C.DIM, ZIndex = 31 }, Pan.oPanel)
+mk("UICorner", { CornerRadius = UDim.new(0, 7) }, oClose)
+
+	mk("TextLabel", { Size = UDim2.new(1, 0, 0, 14), Position = UDim2.fromOffset(0, 26), BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold, Text = "CHAT SLOWDOWN (everyone but you)", TextSize = 9.5,
+		TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31 }, Pan.oPanel)
+
+	Pan.presetBtns = {}
+	for i, p in ipairs({ { 0, "OFF" }, { 3, "3s" }, { 5, "5s" }, { 10, "10s" }, { 30, "30s" } }) do
+		local b = mk("TextButton", { Size = UDim2.fromOffset(54, 26), Position = UDim2.fromOffset((i - 1) * 60, 44),
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255), BackgroundTransparency = .95, BorderSizePixel = 0,
+			AutoButtonColor = false, Font = Enum.Font.GothamBold, Text = p[2], TextSize = 10.5,
+			TextColor3 = Color3.fromRGB(201, 196, 224), ZIndex = 31 }, Pan.oPanel)
+		mk("UICorner", { CornerRadius = UDim.new(0, 9) }, b)
+		Pan.presetBtns[i] = { btn = b, val = p[1] }
+		b.MouseButton1Click:Connect(function()
+			Cfg.slow = p[1]
+			Net.broadcast()
+			Pan.refresh()
+			H.status()
+			H.flash(p[1] == 0 and "Slowdown disabled" or ("Slowdown set to " .. p[1] .. "s"), UI.C.OKC)
+		end)
+	end
+
+	mk("TextLabel", { Size = UDim2.new(1, 0, 0, 14), Position = UDim2.fromOffset(0, 88), BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold, Text = "BLACKLIST (cannot chat)", TextSize = 9.5,
+		TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31 }, Pan.oPanel)
+
+	Pan.blBox = mk("TextBox", { Size = UDim2.new(1, -70, 0, 28), Position = UDim2.fromOffset(0, 104),
+		BackgroundColor3 = Color3.fromRGB(255, 255, 255), BackgroundTransparency = .95, BorderSizePixel = 0,
+		Font = Enum.Font.Gotham, Text = "", PlaceholderText = "username, or tap a chatter below",
+		PlaceholderColor3 = Color3.fromRGB(110, 110, 138),
+		TextSize = 11, TextColor3 = UI.C.FG, TextXAlignment = Enum.TextXAlignment.Left,
+		ClearTextOnFocus = false, ZIndex = 31 }, Pan.oPanel)
+	mk("UICorner", { CornerRadius = UDim.new(0, 9) }, Pan.blBox)
+	mk("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, Pan.blBox)
+
+	local blAdd = mk("TextButton", { Size = UDim2.fromOffset(64, 28), Position = UDim2.new(1, -64, 0, 104),
+		BackgroundColor3 = UI.C.A, BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBlack,
+		Text = "ADD", TextSize = 10, TextColor3 = Color3.new(1, 1, 1), ZIndex = 31 }, Pan.oPanel)
+	mk("UICorner", { CornerRadius = UDim.new(0, 9) }, blAdd)
+
+	Pan.blScroll = mk("ScrollingFrame", { Size = UDim2.new(1, 0, 0, 52), Position = UDim2.fromOffset(0, 136),
+		BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+		ScrollBarImageColor3 = Color3.fromRGB(70, 70, 100), CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y, ZIndex = 32 }, Pan.oPanel)
+	Pan.blList = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.Y }, Pan.blScroll)
+
+	mk("TextLabel", { Size = UDim2.new(1, 0, 0, 14), Position = UDim2.fromOffset(0, 194), BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold, Text = "ACTIVE CHATTERS — tap + to block", TextSize = 9.5,
+		TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31 }, Pan.oPanel)
+
+	Pan.rScroll = mk("ScrollingFrame", { Size = UDim2.new(1, 0, 0, 80), Position = UDim2.fromOffset(0, 210),
+		BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+		ScrollBarImageColor3 = Color3.fromRGB(70, 70, 100), CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y, ZIndex = 32 }, Pan.oPanel)
+	Pan.rList = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.Y }, Pan.rScroll)
+
+	mk("TextLabel", { Size = UDim2.new(1, 0, 0, 14), Position = UDim2.fromOffset(0, 300), BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold, Text = "MEMORY (everyone)", TextSize = 9.5,
+		TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31 }, Pan.oPanel)
+
+	Pan.purgeBtn = mk("TextButton", { Size = UDim2.new(1, 0, 0, 32), Position = UDim2.fromOffset(0, 316),
+		BackgroundColor3 = UI.C.BADC, BackgroundTransparency = .18, BorderSizePixel = 0, AutoButtonColor = false,
+		Font = Enum.Font.GothamBlack, Text = "PURGE ALL MESSAGES", TextSize = 10.5,
+		TextColor3 = Color3.new(1, 1, 1), ZIndex = 31 }, Pan.oPanel)
+	mk("UICorner", { CornerRadius = UDim.new(0, 9) }, Pan.purgeBtn)
+
+	Pan.purgeBtn.MouseButton1Click:Connect(function()
+		if not Pan.purgeArmed then
+			Pan.purgeArmed = true
+			Pan.purgeTok = Pan.purgeTok + 1
+			local tok = Pan.purgeTok
+			Pan.purgeBtn.Text = "TAP AGAIN TO PURGE"
+			task.delay(2.5, function()
+				if tok == Pan.purgeTok and Pan.purgeArmed then
+					Pan.purgeArmed = false
+					Pan.purgeBtn.Text = "PURGE ALL MESSAGES"
+				end
+			end)
+			return
+		end
+		Pan.purgeArmed = false
+		Pan.purgeTok = Pan.purgeTok + 1
+		Pan.purgeBtn.Text = "PURGE ALL MESSAGES"
+		local n = #Mem.history
+		local ok, id, relayTs = Net.post({ sys = "cfg", u = plr.Name, slow = Cfg.slow, bl = Cfg.blacklist,
+			purge = 0, del = Cfg.del })
+		local ts = relayTs or Cfg.now()
+		if id then Net.sinceTab[Net.myShard] = id end
+		Cfg.purgeTs = ts
+		Net.broadcast()
+		H.purge(ts)
+		H.flash("Purged " .. n .. " message" .. (n == 1 and "" or "s") .. " for everyone", UI.C.OKC)
+	end)
+
+	function Pan.refreshRoster()
+		if not Pan.rList or not Pan.rList.Parent then return end
+		Pan.rList:ClearAllChildren()
+		mk("UIListLayout", { Padding = UDim.new(0, 4) }, Pan.rList)
+		if #Cfg.roster == 0 then
+			mk("TextLabel", { Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+				Text = "nobody has chatted yet", TextSize = 10, TextColor3 = UI.C.DIM,
+				TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 33 }, Pan.rList)
+			return
+		end
+		local shown = 0
+		for i = #Cfg.roster, 1, -1 do
+			local rec = Cfg.roster[i]
+			shown = shown + 1
+			if shown > 40 then break end
+			local key = lc(rec.u)
+			local blocked = Cfg.blSet[key] == true
+			local row = mk("Frame", { Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1, ZIndex = 32 }, Pan.rList)
+			local bav = mk("ImageLabel", { Size = UDim2.fromOffset(20, 20), Position = UDim2.fromOffset(0, 2),
+				BackgroundColor3 = Color3.fromRGB(45, 42, 66), BorderSizePixel = 0, Image = "",
+				ImageTransparency = 1, ZIndex = 34 }, row)
+			mk("UICorner", { CornerRadius = UDim.new(1, 0) }, bav)
+			UI.loadAvatar(bav, rec.uid, rec.u)
+			mk("TextLabel", { Size = UDim2.new(1, -52, 1, 0), Position = UDim2.fromOffset(26, 0), BackgroundTransparency = 1,
+				Font = Enum.Font.GothamBold, Text = rec.u .. (rec.u == plr.Name and " (you)" or ""), TextSize = 10.5,
+				TextColor3 = blocked and UI.C.BADC or UI.C.FG,
+				TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 33 }, row)
+			local tg = mk("TextButton", { Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, -22, 0, 1),
+				BackgroundColor3 = blocked and UI.C.BADC or UI.C.A, BackgroundTransparency = .2,
+				BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBlack,
+				Text = blocked and "−" or "+", TextSize = 13, TextColor3 = Color3.new(1, 1, 1), ZIndex = 33 }, row)
+			mk("UICorner", { CornerRadius = UDim.new(0, 7) }, tg)
+			tg.MouseButton1Click:Connect(function() Cfg.toggleBlacklist(rec.u) end)
+		end
+	end
+
+	function Pan.refresh()
+		if not Pan.presetBtns then return end
+		for _, pb in ipairs(Pan.presetBtns) do
+			local on = (Cfg.slow == pb.val)
+			pb.btn.BackgroundTransparency = on and .35 or .95
+			pb.btn.TextColor3 = on and Color3.new(1, 1, 1) or Color3.fromRGB(201, 196, 224)
+		end
+		Pan.blList:ClearAllChildren()
+		mk("UIListLayout", { Padding = UDim.new(0, 4) }, Pan.blList)
+		if #Cfg.blacklist == 0 then
+			mk("TextLabel", { Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+				Text = "no one blacklisted", TextSize = 10, TextColor3 = UI.C.DIM,
+				TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 33 }, Pan.blList)
+		end
+		for i, name in ipairs(Cfg.blacklist) do
+			local row = mk("Frame", { Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1, LayoutOrder = i, ZIndex = 32 }, Pan.blList)
+			local bav = mk("ImageLabel", { Size = UDim2.fromOffset(20, 20), Position = UDim2.fromOffset(0, 2),
+				BackgroundColor3 = Color3.fromRGB(45, 42, 66), BorderSizePixel = 0, Image = "",
+				ImageTransparency = 1, ZIndex = 34 }, row)
+			mk("UICorner", { CornerRadius = UDim.new(1, 0) }, bav)
+			UI.loadAvatar(bav, nil, name)
+			mk("TextLabel", { Size = UDim2.new(1, -52, 1, 0), Position = UDim2.fromOffset(26, 0), BackgroundTransparency = 1,
+				Font = Enum.Font.GothamBold, Text = name, TextSize = 10.5, TextColor3 = UI.C.FG,
+				TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 33 }, row)
+			local x = mk("TextButton", { Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, -22, 0, 1),
+				BackgroundColor3 = UI.C.BADC, BackgroundTransparency = .2, BorderSizePixel = 0, AutoButtonColor = false,
+				Font = Enum.Font.GothamBold, Text = "×", TextSize = 12, TextColor3 = Color3.new(1, 1, 1), ZIndex = 33 }, row)
+			mk("UICorner", { CornerRadius = UDim.new(0, 7) }, x)
+			x.MouseButton1Click:Connect(function() Cfg.toggleBlacklist(name) end)
+		end
+		Pan.refreshRoster()
+	end
+
+	local function blAddName()
+		local n = Pan.blBox.Text:gsub("%s", "")
+		if #n == 0 then return end
+		Pan.blBox.Text = ""
+		if Cfg.blSet[lc(n)] then H.flash(n .. " already blacklisted", UI.C.BADC); return end
+		Cfg.blacklist[#Cfg.blacklist + 1] = n
+		Cfg.blSet[lc(n)] = true
+		Net.broadcast(); Pan.refresh()
+		H.flash("Blacklisted " .. n, UI.C.OKC)
+	end
+	blAdd.MouseButton1Click:Connect(blAddName)
+	Pan.blBox.FocusLost:Connect(function(enter) if enter then blAddName() end end)
+
+	task.spawn(function()
+		while running and Pan.oPanel.Parent do
+			if Pan.rosterDirty and Pan.ownerOpen then
+				Pan.rosterDirty = false
+				Pan.refreshRoster()
+			end
+			task.wait(0.4)
+		end
+	end)
+
+	function Pan.openOwner()
+		Pan.close()
+		Soc.closeAll()
+		Pan.ownerOpen = true
+		Pan.oPanel.Visible = true
+		Pan.oPanel.Position = UDim2.new(0, 12, 0, 44)
+		Pan.refresh()
+		tw(Pan.oPanel, .3, { Position = UDim2.new(0, 12, 0, 50) }, Enum.EasingStyle.Back)
+	end
+	function Pan.closeOwner()
+		if not Pan.ownerOpen then return end
+		Pan.ownerOpen = false
+		tw(Pan.oPanel, .2, { Position = UDim2.new(0, 12, 0, 44) })
+		task.delay(.22, function() if not Pan.ownerOpen then Pan.oPanel.Visible = false end end)
+	end
+	oClose.MouseButton1Click:Connect(Pan.closeOwner)
+
+	local ownB = UI.ctrl("★", -88)
+	ownB.Visible = Cfg.me
+	ownB.MouseButton1Click:Connect(function()
+		if Pan.ownerOpen then Pan.closeOwner() else Pan.openOwner() end
+	end)
+
+	UI.gifBtn.MouseButton1Click:Connect(function() Pan.open("gif", "global") end)
+	UI.emoBtn.MouseButton1Click:Connect(function() Pan.open("emoji", "global") end)
+end
+
+-- ╔══════════════════════════════════════════════════════════╗
+-- ║  SOCIAL LAYER — profiles · dms · groups                  ║
+-- ╚══════════════════════════════════════════════════════════╝
+Link.chans = {}
+function Link.slug(s) return (string.lower(tostring(s)):gsub("[^%w_%-]", "")) end
+function Link.profTopic(n) return "nebula_prof_v2_" .. Link.slug(n) end
+function Link.dmTopic(n) return "nebula_dm_v2_" .. Link.slug(n) end
+function Link.grpTopic(c) return "nebula_grp_v2_" .. Link.slug(c) end
+
+function Link.post(topic, payload)
+	local ok, res = pcall(function()
+		return Http:RequestAsync({ Url = Net.url .. topic, Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" }, Body = Http:JSONEncode(payload) })
+	end)
+	if ok and res and res.Success then
+		local okd, dec = pcall(Http.JSONDecode, Http, res.Body)
+		return true, (okd and dec and dec.id) or nil
+	end
+	return false, nil
+end
+
+function Link.pull(topic, since, limit)
+	local ok, res = pcall(function()
+		return Http:RequestAsync({ Url = Net.url .. topic .. "/json?poll=1&since="
+			.. tostring(since) .. "&limit=" .. tostring(limit or 80), Method = "GET" })
+	end)
+	if ok and res and res.Success then return res.Body end
+	return nil
+end
+
+function Link.register(key, topic, handler)
+	local c = Link.chans[key]
+	if c then c.handler = handler; return c end
+	c = { key = key, topic = topic, handler = handler, seen = {}, since = "all" }
+	Link.chans[key] = c
+	return c
+end
+function Link.unregister(key) Link.chans[key] = nil end
+
+function Link.dispatch(c, line)
+	local ok, msg = pcall(Http.JSONDecode, Http, line)
+	if not ok or type(msg) ~= "table" then return end
+	if msg.id then c.since = msg.id end
+	if msg.event ~= "message" or not msg.id or c.seen[msg.id] then return end
+	c.seen[msg.id] = true
+	local pok, data = pcall(Http.JSONDecode, Http, msg.message)
+	if not pok or type(data) ~= "table" then return end
+	pcall(c.handler, data)
+end
+
+task.spawn(function()
+	while running and gui.Parent do
+		local keys = {}
+		for k in pairs(Link.chans) do keys[#keys + 1] = k end
+		for _, k in ipairs(keys) do
+			local c = Link.chans[k]
+			if c and running and gui.Parent then
+				local body = Link.pull(c.topic, c.since, 80)
+				if body then
+					for line in string.gmatch(body, "[^\n]+") do Link.dispatch(c, line) end
+				end
+				task.wait(0.35)
+			end
+		end
+		task.wait(3)
+	end
+end)
+
+Soc.pathP, Soc.pathD, Soc.pathG = "nebula_profile_v2.json", "nebula_dms_v2.json", "nebula_groups_v2.json"
+Soc.prof = { desc = "", first = Cfg.now(), chats = 0, rep = 0, cr = nil, fr = nil, dn = nil, vf = false }
+Soc.cards, Soc.peers, Soc.peerOrder = {}, {}, {}
+Soc.groups, Soc.gmsgs = {}, {}
+Soc.pending, Soc.viewOpen, Soc.lastPub = false, false, 0
+Soc.DESC_MAX, Soc.GROUP_MAX = 200, 30
+Soc.info = {}
+Soc.mine = { display = plr.DisplayName, created = nil, friends = nil, badge = false }
+
+function Soc.ageDays(created)
+	if not created then return nil end
+	return math.max(0, math.floor((Cfg.now() - created) / 86400))
+end
+function Soc.stamp(created)
+	if not created then return "unknown" end
+	local ok, s = pcall(os.date, "%b %d, %Y", created)
+	return ok and s or "unknown"
+end
+function Soc.isoUnix(iso)
+	if type(iso) ~= "string" then return nil end
+	local y, mo, d, h, mi, s = iso:match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
+	if not y then return nil end
+	local ok, t = pcall(os.time, { year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+		hour = tonumber(h), min = tonumber(mi), sec = tonumber(s) })
+	return (ok and type(t) == "number") and t or nil
+end
+
+function Soc.webGet(url)
+	local ok, res = pcall(function()
+		return Http:RequestAsync({ Url = url, Method = "GET", Headers = { ["Accept"] = "application/json" } })
+	end)
+	if ok and res and res.Success then
+		local okd, d = pcall(Http.JSONDecode, Http, res.Body)
+		if okd and type(d) == "table" then return d end
+	end
+	return nil
+end
+
+function Soc.realInfo(name, cb)
+	local key = lc(name)
+	local hit = Soc.info[key]
+	if hit and os.clock() - hit.at < 180 then cb(hit); return end
+	task.spawn(function()
+		local rec = { at = os.clock(), id = nil, display = name, created = nil, friends = nil, badge = false }
+		if name == plr.Name then
+			rec.id = plr.UserId
+			rec.display = plr.DisplayName
+			local age = tonumber(plr.AccountAge)
+			if age and age >= 0 then rec.created = Cfg.now() - age * 86400 end
+		else
+			local ok, r = pcall(function() return Players:GetUserIdFromNameAsync(name) end)
+			if ok and type(r) == "number" then rec.id = r end
+		end
+		if rec.id then
+			if not rec.created or rec.display == name then
+				local d = Soc.webGet("https://users.roblox.com/v1/users/" .. rec.id)
+				if d then
+					rec.display = d.displayName or d.name or rec.display
+					rec.created = rec.created or Soc.isoUnix(d.created)
+					rec.badge = d.hasVerifiedBadge == true
+				end
+			end
+			if not rec.created then
+				local ok2, info = pcall(function() return Players:GetUserInfoAsync(rec.id) end)
+				if ok2 and info then
+					if info.CreationDate then rec.created = info.CreationDate.UnixTimestamp end
+					if info.DisplayName then rec.display = info.DisplayName end
+					rec.badge = info.HasVerifiedBadge == true
+				end
+			end
+			local fc = Soc.webGet("https://friends.roblox.com/v1/users/" .. rec.id .. "/friends/count")
+			if fc and tonumber(fc.count) then rec.friends = tonumber(fc.count) end
+			if not rec.friends then
+				local ok3, pages = pcall(function() return Players:GetFriendsAsync(rec.id) end)
+				if ok3 and pages then
+					local n, guard = 0, 0
+					while true do
+						local okc, items = pcall(function() return pages:GetCurrentPage() end)
+						if not okc or not items then break end
+						n = n + #items
+						guard = guard + 1
+						if pages.IsFinished or guard >= 5 then break end
+						pcall(function() pages:AdvanceToNextPageAsync() end)
+					end
+					rec.friends = n
+				end
+			end
+		end
+		Soc.info[key] = rec
+		if running then cb(rec) end
+	end)
+end
+
+function Soc.peer(name, uid)
+	local key = lc(name)
+	local p = Soc.peers[key]
+	if not p then
+		p = { n = name, uid = uid, msgs = {}, unread = 0, t = Cfg.now() }
+		Soc.peers[key] = p
+		Soc.peerOrder[#Soc.peerOrder + 1] = key
+	end
+	if uid then p.uid = uid end
+	return p
+end
+
+function Soc.saveNow()
+	if not FS.ok then return end
+	pcall(function()
+		FS.write(Soc.pathP, Http:JSONEncode({ desc = Soc.prof.desc, first = Soc.prof.first,
+			chats = Soc.prof.chats, rep = Soc.prof.rep, cr = Soc.prof.cr,
+			fr = Soc.prof.fr, dn = Soc.prof.dn, vf = Soc.prof.vf }))
+	end)
+	local peers = {}
+	for _, k in ipairs(Soc.peerOrder) do
+		local p = Soc.peers[k]
+		if p then peers[#peers + 1] = { n = p.n, uid = p.uid, unread = p.unread, t = p.t, msgs = p.msgs } end
+	end
+	pcall(function() FS.write(Soc.pathD, Http:JSONEncode({ peers = peers })) end)
+	local gs = {}
+	for code, g in pairs(Soc.groups) do
+		gs[#gs + 1] = { code = code, name = g.name, owner = g.owner, members = g.members, msgs = Soc.gmsgs[code] or {} }
+	end
+	pcall(function() FS.write(Soc.pathG, Http:JSONEncode({ groups = gs })) end)
+end
+
+function Soc.save()
+	if Soc.pending then return end
+	Soc.pending = true
+	task.delay(1.2, function() Soc.pending = false; Soc.saveNow() end)
+end
+
+function Soc.load()
+	if not FS.ok then return end
+	local ok, raw = pcall(FS.read, Soc.pathP)
+	if ok and type(raw) == "string" and #raw > 0 then
+		local okd, d = pcall(Http.JSONDecode, Http, raw)
+		if okd and type(d) == "table" then
+			Soc.prof.desc = tostring(d.desc or "")
+			Soc.prof.first = tonumber(d.first) or Soc.prof.first
+			Soc.prof.chats = tonumber(d.chats) or 0
+			Soc.prof.rep = tonumber(d.rep) or 0
+			Soc.prof.cr = tonumber(d.cr)
+			Soc.prof.fr = tonumber(d.fr)
+			Soc.prof.dn = d.dn
+			Soc.prof.vf = d.vf == true
+		end
+	end
+	ok, raw = pcall(FS.read, Soc.pathD)
+	if ok and type(raw) == "string" and #raw > 0 then
+		local okd, d = pcall(Http.JSONDecode, Http, raw)
+		if okd and type(d) == "table" and type(d.peers) == "table" then
+			for _, p in ipairs(d.peers) do
+				if type(p) == "table" and type(p.n) == "string" then
+					local rec = Soc.peer(p.n, tonumber(p.uid))
+					rec.unread = tonumber(p.unread) or 0
+					rec.t = tonumber(p.t) or 0
+					if type(p.msgs) == "table" then
+						for _, m in ipairs(p.msgs) do
+							if type(m) == "table" and type(m.m) == "string" then
+								rec.msgs[#rec.msgs + 1] = { u = tostring(m.u or p.n), m = m.m,
+									t = tonumber(m.t) or 0, sys = m.sys,
+									img = type(m.img) == "string" and m.img or nil,
+									iw = tonumber(m.iw), ih = tonumber(m.ih) }
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	ok, raw = pcall(FS.read, Soc.pathG)
+	if ok and type(raw) == "string" and #raw > 0 then
+		local okd, d = pcall(Http.JSONDecode, Http, raw)
+		if okd and type(d) == "table" and type(d.groups) == "table" then
+			for _, g in ipairs(d.groups) do
+				if type(g) == "table" and type(g.code) == "string" and #g.code > 0 then
+					Soc.groups[g.code] = { code = g.code, name = tostring(g.name or "group"),
+						owner = tostring(g.owner or "?"),
+						members = type(g.members) == "table" and g.members or { plr.Name } }
+					local list = {}
+					if type(g.msgs) == "table" then
+						for _, m in ipairs(g.msgs) do
+							if type(m) == "table" and type(m.m) == "string" then
+								list[#list + 1] = { u = tostring(m.u or "?"), m = m.m, t = tonumber(m.t) or 0,
+									img = type(m.img) == "string" and m.img or nil,
+									iw = tonumber(m.iw), ih = tonumber(m.ih) }
+							end
+						end
+					end
+					Soc.gmsgs[g.code] = list
+				end
+			end
+		end
+	end
+end
+
+function Soc.publish()
+	if os.clock() - Soc.lastPub < 6 then return end
+	Soc.lastPub = os.clock()
+	Link.post(Link.profTopic(plr.Name), { sys = "prof", u = plr.Name, uid = plr.UserId,
+		d = Soc.prof.desc, dn = Soc.prof.dn, cr = Soc.prof.cr, fr = Soc.prof.fr, vf = Soc.prof.vf,
+		days = Soc.ageDays(Soc.prof.cr) or 0, chats = Soc.prof.chats, rep = Soc.prof.rep })
+end
+
+function Soc.bump(kind)
+	Soc.prof[kind] = (Soc.prof[kind] or 0) + 1
+	Soc.save()
+	if Soc.viewOpen then Soc.renderView() end
+	Soc.publish()
+end
+
+function Soc.syncMine(cb)
+	Soc.realInfo(plr.Name, function(rec)
+		Soc.mine = {
+			display = rec.display or Soc.mine.display,
+			created = rec.created or Soc.mine.created,
+			friends = rec.friends or Soc.mine.friends,
+			badge = rec.badge,
+		}
+		Soc.prof.dn = Soc.mine.display
+		Soc.prof.cr = Soc.mine.created
+		Soc.prof.fr = Soc.mine.friends
+		Soc.prof.vf = Soc.mine.badge
+		Soc.save()
+		Soc.lastPub = 0
+		Soc.publish()
+		if cb then cb(Soc.mine) end
+	end)
+end
+
+function Soc.fetch(name, cb)
+	local key = lc(name)
+	local hit = Soc.cards[key]
+	if hit and os.clock() - hit.at < 45 then cb(hit); return end
+	task.spawn(function()
+		local rec = { name = name, at = os.clock(), desc = "", days = 0, chats = 0, rep = 0,
+			uid = nil, dn = nil, cr = nil, fr = nil, vf = false }
+		local body = Link.pull(Link.profTopic(name), "all", 20)
+		if body then
+			local last
+			for line in string.gmatch(body, "[^\n]+") do last = line end
+			if last then
+				local ok, m = pcall(Http.JSONDecode, Http, last)
+				if ok and type(m) == "table" and m.message then
+					local ok2, d = pcall(Http.JSONDecode, Http, m.message)
+					if ok2 and type(d) == "table" then
+						rec.desc = tostring(d.d or "")
+						rec.days = tonumber(d.days) or 0
+						rec.chats = tonumber(d.chats) or 0
+						rec.rep = tonumber(d.rep) or 0
+						rec.uid = tonumber(d.uid)
+						rec.dn = d.dn
+						rec.cr = tonumber(d.cr)
+						rec.fr = tonumber(d.fr)
+						rec.vf = d.vf == true
+					end
+				end
+			end
+		end
+		Soc.cards[key] = rec
+		if running then cb(rec) end
+	end)
+end
+
+-- ── profile card ────────────────────────────────────────────
+Card.W, Card.H, Card.curH = 320, 352, 352
+Card.frame = mk("Frame", { Name = "ProfileCard", Size = UDim2.fromOffset(Card.W, Card.H),
+	Position = UDim2.fromOffset(0, 0), BackgroundColor3 = Color3.fromRGB(18, 17, 30),
+	BorderSizePixel = 0, Visible = false, ClipsDescendants = true, ZIndex = 40 }, UI.layer)
+mk("UICorner", { CornerRadius = UDim.new(0, 16) }, Card.frame)
+mk("UIStroke", { Thickness = 1, Color = Color3.fromRGB(96, 86, 150), Transparency = .4 }, Card.frame)
+
+function Card.close() Card.frame.Visible = false end
+
+function Card.fill(rec)
+	if not Card.frame.Visible then return end
+	if Card.dn then Card.dn.Text = rec.dn or rec.name end
+	local days = rec.days
+	if days == nil and rec.cr then days = Soc.ageDays(rec.cr) end
+	if Card.age then Card.age.Text = days and tostring(days) or "–" end
+	if Card.fr then Card.fr.Text = rec.fr and tostring(rec.fr) or "–" end
+	if Card.chats then Card.chats.Text = tostring(rec.chats or 0) end
+	if Card.rep then Card.rep.Text = tostring(rec.rep or 0) end
+	if Card.cr then Card.cr.Text = "joined " .. Soc.stamp(rec.cr) end
+	if Card.desc then
+		Card.desc.Text = (#rec.desc > 0) and rec.desc or "no description yet"
+		Card.desc.TextColor3 = (#rec.desc > 0) and Color3.fromRGB(210, 206, 228) or UI.C.DIM
+	end
+	if Card.badge then Card.badge.Visible = rec.vf == true end
+end
+
+function Card.show(name, uid)
+	if name == plr.Name then Soc.publish() end
+	Card.frame.Visible = true
+	Card.curH = select(2, UI.dockWin(Card.frame, Card.W, Card.H, 344))
+	Card.dn, Card.age, Card.fr, Card.chats, Card.rep, Card.cr, Card.desc, Card.badge = nil, nil, nil, nil, nil, nil, nil, nil
+	for _, c in ipairs(Card.frame:GetChildren()) do
+		if c:IsA("GuiObject") then c:Destroy() end
+	end
+
+	local closeB = mk("TextButton", { Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, -10, 0, 10),
+		BackgroundColor3 = Color3.fromRGB(38, 38, 56), BorderSizePixel = 0, AutoButtonColor = false,
+		Font = Enum.Font.GothamBold, Text = "×", TextSize = 12, TextColor3 = UI.C.DIM, ZIndex = 42 }, Card.frame)
+	mk("UICorner", { CornerRadius = UDim.new(0, 7) }, closeB)
+	closeB.MouseButton1Click:Connect(Card.close)
+
+	local av = mk("ImageLabel", { Size = UDim2.fromOffset(64, 64), Position = UDim2.new(.5, 0, 0, 14),
+		AnchorPoint = Vector2.new(.5, 0), BackgroundColor3 = Color3.fromRGB(45, 42, 66),
+		BorderSizePixel = 0, Image = "", ImageTransparency = 1, ZIndex = 41 }, Card.frame)
+	mk("UICorner", { CornerRadius = UDim.new(1, 0) }, av)
+	mk("UIStroke", { Thickness = 2, Color = Cfg.isOwner(name) and UI.C.WARN or UI.C.A, Transparency = .2 }, av)
+	UI.loadAvatar(av, uid, name)
+
+	Card.dn = mk("TextLabel", { Size = UDim2.new(1, -60, 0, 17), Position = UDim2.new(.5, 0, 0, 84),
+		AnchorPoint = Vector2.new(.5, 0), BackgroundTransparency = 1, Font = Enum.Font.GothamBlack,
+		Text = name, TextSize = 13, TextColor3 = UI.C.FG, TextXAlignment = Enum.TextXAlignment.Center,
+		ZIndex = 41 }, Card.frame)
+
+	mk("TextLabel", { Size = UDim2.new(1, -60, 0, 13), Position = UDim2.new(.5, 0, 0, 101),
+		AnchorPoint = Vector2.new(.5, 0), BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+		Text = "@" .. name, TextSize = 10, TextColor3 = UI.C.DIM,
+		TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 41 }, Card.frame)
+
+	Card.badge = mk("TextLabel", { Size = UDim2.fromOffset(14, 14), Position = UDim2.new(.5, 0, 0, 84),
+		AnchorPoint = Vector2.new(0, 0), BackgroundTransparency = 1, Font = Enum.Font.GothamBlack,
+		Text = "✔", TextSize = 10, TextColor3 = Color3.fromRGB(60, 170, 255),
+		Visible = false, ZIndex = 42 }, Card.frame)
+
+	local function chip(x, w, caption)
+		local f = mk("Frame", { Size = UDim2.fromOffset(w, 40), Position = UDim2.fromOffset(x, 122),
+			BackgroundColor3 = Color3.fromRGB(28, 26, 44), BorderSizePixel = 0, ZIndex = 41 }, Card.frame)
+		mk("UICorner", { CornerRadius = UDim.new(0, 10) }, f)
+		local v = mk("TextLabel", { Size = UDim2.new(1, 0, 0, 20), Position = UDim2.fromOffset(0, 4),
+			BackgroundTransparency = 1, Font = Enum.Font.GothamBlack, Text = "–", TextSize = 13,
+			TextColor3 = UI.C.FG, TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 42 }, f)
+		mk("TextLabel", { Size = UDim2.new(1, 0, 0, 12), Position = UDim2.fromOffset(0, 24),
+			BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = caption, TextSize = 7.5,
+			TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 42 }, f)
+		return v
+	end
+	Card.age = chip(12, 68, "ACCOUNT AGE")
+	Card.fr = chip(86, 68, "FRIENDS")
+	Card.chats = chip(160, 68, "CHATS")
+	Card.rep = chip(234, 68, "REPLIES")
+
+	Card.cr = mk("TextLabel", { Size = UDim2.new(1, -24, 0, 12), Position = UDim2.fromOffset(12, 168),
+		BackgroundTransparency = 1, Font = Enum.Font.Gotham, Text = "joined —", TextSize = 9,
+		TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 41 }, Card.frame)
+
+	Card.desc = mk("TextLabel", { Size = UDim2.new(1, -24, 0, 100), Position = UDim2.fromOffset(12, 184),
+		BackgroundColor3 = Color3.fromRGB(24, 23, 38), BorderSizePixel = 0, Font = Enum.Font.Gotham,
+		Text = "loading...", TextSize = 10.5, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
+		TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 41 }, Card.frame)
+	mk("UICorner", { CornerRadius = UDim.new(0, 10) }, Card.desc)
+	mk("UIPadding", { PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
+		PaddingLeft = UDim.new(0, 9), PaddingRight = UDim.new(0, 9) }, Card.desc)
+
+	local function act(txt, x, w, col, fn)
+		local b = mk("TextButton", { Size = UDim2.fromOffset(w, 30), Position = UDim2.fromOffset(x, 296),
+			BackgroundColor3 = col, BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBlack,
+			Text = txt, TextSize = 10, TextColor3 = Color3.new(1, 1, 1), ZIndex = 42 }, Card.frame)
+		mk("UICorner", { CornerRadius = UDim.new(0, 9) }, b)
+		b.MouseButton1Click:Connect(fn)
+		return b
+	end
+
+	if name == plr.Name then
+		act("SYNC", 12, 84, Color3.fromRGB(52, 48, 80), function()
+			Soc.syncMine(function(m)
+				Card.fill({ name = plr.Name, dn = m.display, days = Soc.ageDays(m.created),
+					fr = m.friends, chats = Soc.prof.chats, rep = Soc.prof.rep,
+					cr = m.created, desc = Soc.prof.desc, vf = m.badge })
+			end)
+		end)
+		act("EDIT PROFILE", 102, 206, UI.C.A, function() Card.close(); Soc.openView() end)
+	else
+		act("MESSAGE", 12, 152, UI.C.A, function() Card.close(); DM.open(name, uid) end)
+		local bl
+		bl = act(Cfg.blocked(name) and "UNBLOCK" or "BLOCK", 170, 138,
+			Cfg.blocked(name) and UI.C.OKC or Color3.fromRGB(120, 56, 66), function()
+				Cfg.toggleBlacklist(name)
+				bl.Text = Cfg.blocked(name) and "UNBLOCK" or "BLOCK"
+				bl.BackgroundColor3 = Cfg.blocked(name) and UI.C.OKC or Color3.fromRGB(120, 56, 66)
+			end)
+	end
+
+	Soc.fetch(name, function(rec)
+		Card.fill(rec)
+		if not rec.cr or not rec.dn or not rec.fr then
+			Soc.realInfo(name, function(real)
+				if not Card.frame.Visible then return end
+				Card.fill({ name = name, dn = real.display, days = Soc.ageDays(real.created),
+					fr = real.friends, chats = rec.chats, rep = rec.rep, cr = real.created,
+					desc = rec.desc, vf = real.badge })
+			end)
+		end
+	end)
+end
+
+-- ── own profile tab ─────────────────────────────────────────
+Soc.viewPanel = mk("Frame", { Size = UDim2.new(1, -24, 1, -56), Position = UDim2.new(0, 12, 0, 50),
+	BackgroundColor3 = Color3.fromRGB(18, 17, 30), BorderSizePixel = 0, Visible = false, ZIndex = 30 }, UI.cg)
+mk("UICorner", { CornerRadius = UDim.new(0, 14) }, Soc.viewPanel)
+mk("UIPadding", { PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 12),
+	PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }, Soc.viewPanel)
+mk("TextLabel", { Size = UDim2.new(1, -30, 0, 18), BackgroundTransparency = 1, Font = Enum.Font.GothamBlack,
+	Text = "MY PROFILE  ·  only you see this tab", TextSize = 10.5, TextColor3 = Color3.fromRGB(216, 207, 251),
+	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31 }, Soc.viewPanel)
+
+local vClose = mk("TextButton", { Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, 0, 0, -2),
+	BackgroundColor3 = Color3.fromRGB(38, 38, 56), BorderSizePixel = 0, AutoButtonColor = false,
+	Font = Enum.Font.GothamBold, Text = "×", TextSize = 12, TextColor3 = UI.C.DIM, ZIndex = 31 }, Soc.viewPanel)
+mk("UICorner", { CornerRadius = UDim.new(0, 7) }, vClose)
+vClose.MouseButton1Click:Connect(function() Soc.closeView() end)
+
+local vAv = mk("ImageLabel", { Size = UDim2.fromOffset(52, 52), Position = UDim2.fromOffset(0, 26),
+	BackgroundColor3 = Color3.fromRGB(45, 42, 66), BorderSizePixel = 0, Image = "", ImageTransparency = 1,
+	ZIndex = 31 }, Soc.viewPanel)
+mk("UICorner", { CornerRadius = UDim.new(1, 0) }, vAv)
+mk("UIStroke", { Thickness = 2, Color = UI.C.A, Transparency = .2 }, vAv)
+UI.loadAvatar(vAv, plr.UserId, plr.Name)
+
+Soc.viewName = mk("TextLabel", { Size = UDim2.new(1, -62, 0, 18), Position = UDim2.fromOffset(60, 28),
+	BackgroundTransparency = 1, Font = Enum.Font.GothamBlack, Text = plr.DisplayName, TextSize = 12,
+	TextColor3 = UI.C.FG, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31 }, Soc.viewPanel)
+Soc.viewHandle = mk("TextLabel", { Size = UDim2.new(1, -62, 0, 13), Position = UDim2.fromOffset(60, 46),
+	BackgroundTransparency = 1, Font = Enum.Font.Gotham, Text = "@" .. plr.Name, TextSize = 9.5,
+	TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31 }, Soc.viewPanel)
+Soc.statLine = mk("TextLabel", { Size = UDim2.new(1, -62, 0, 14), Position = UDim2.fromOffset(60, 60),
+	BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "loading account info...", TextSize = 9,
+	TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31 }, Soc.viewPanel)
+
+mk("TextLabel", { Size = UDim2.new(1, 0, 0, 14), Position = UDim2.fromOffset(0, 88), BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold, Text = "DESCRIPTION — shown on your card to anyone who taps you",
+	TextSize = 9.5, TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31 }, Soc.viewPanel)
+
+Soc.descBox = mk("TextBox", { Size = UDim2.new(1, -30, 0, 100), Position = UDim2.fromOffset(0, 104),
+	BackgroundColor3 = Color3.fromRGB(255, 255, 255), BackgroundTransparency = .95, BorderSizePixel = 0,
+	Font = Enum.Font.Gotham, Text = "", PlaceholderText = "say something about yourself...",
+	PlaceholderColor3 = Color3.fromRGB(110, 110, 138), TextSize = 11.5, TextColor3 = UI.C.FG,
+	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+	TextWrapped = true, MultiLine = true, ClearTextOnFocus = false, ZIndex = 31 }, Soc.viewPanel)
+mk("UICorner", { CornerRadius = UDim.new(0, 10) }, Soc.descBox)
+mk("UIPadding", { PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
+	PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, Soc.descBox)
+
+Soc.count = mk("TextLabel", { Size = UDim2.new(1, 0, 0, 14), Position = UDim2.fromOffset(0, 208),
+	BackgroundTransparency = 1, Font = Enum.Font.Gotham, Text = "0 / " .. Soc.DESC_MAX, TextSize = 9,
+	TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Right, ZIndex = 31 }, Soc.viewPanel)
+
+local vSave = mk("TextButton", { Size = UDim2.new(1, 0, 0, 32), Position = UDim2.fromOffset(0, 228),
+	BackgroundColor3 = UI.C.A, BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBlack,
+	Text = "SAVE PROFILE", TextSize = 10.5, TextColor3 = Color3.new(1, 1, 1), ZIndex = 31 }, Soc.viewPanel)
+mk("UICorner", { CornerRadius = UDim.new(0, 9) }, vSave)
+
+local vSync = mk("TextButton", { Size = UDim2.new(1, 0, 0, 26), Position = UDim2.fromOffset(0, 266),
+	BackgroundColor3 = Color3.fromRGB(52, 48, 80), BorderSizePixel = 0, AutoButtonColor = false,
+	Font = Enum.Font.GothamBold, Text = "REFRESH ACCOUNT INFO", TextSize = 9.5,
+	TextColor3 = Color3.fromRGB(206, 200, 230), ZIndex = 31 }, Soc.viewPanel)
+mk("UICorner", { CornerRadius = UDim.new(0, 9) }, vSync)
+
+Soc.descBox:GetPropertyChangedSignal("Text"):Connect(function()
+	if #Soc.descBox.Text > Soc.DESC_MAX then
+		Soc.descBox.Text = utf8Cut(Soc.descBox.Text, Soc.DESC_MAX)
+	end
+	Soc.count.Text = #Soc.descBox.Text .. " / " .. Soc.DESC_MAX
+end)
+
+vSave.MouseButton1Click:Connect(function()
+	Soc.prof.desc = utf8Cut(Soc.descBox.Text, Soc.DESC_MAX)
+	Soc.saveNow()
+	Soc.lastPub = 0
+	Soc.publish()
+	H.flash("Profile saved", UI.C.OKC)
+end)
+vSync.MouseButton1Click:Connect(function()
+	Soc.info[lc(plr.Name)] = nil
+	Soc.syncMine(function() Soc.renderView(); H.flash("Account info refreshed", UI.C.OKC) end)
+end)
+
+function Soc.renderView()
+	if not Soc.viewOpen then return end
+	Soc.viewName.Text = Soc.mine.display or plr.DisplayName
+	local days = Soc.ageDays(Soc.mine.created)
+	Soc.statLine.Text = string.format("age %s · %s friends · %d chats · %d replies",
+		days and (days .. "d") or "—",
+		Soc.mine.friends and tostring(Soc.mine.friends) or "—",
+		Soc.prof.chats, Soc.prof.rep)
+end
+
+function Soc.openView()
+	Soc.closeAll()
+	Soc.viewOpen = true
+	Soc.viewPanel.Visible = true
+	Soc.viewPanel.Position = UDim2.new(0, 12, 0, 44)
+	Soc.descBox.Text = Soc.prof.desc
+	Soc.count.Text = #Soc.prof.desc .. " / " .. Soc.DESC_MAX
+	Soc.renderView()
+	Soc.syncMine(function() Soc.renderView() end)
+	Soc.publish()
+	tw(Soc.viewPanel, .3, { Position = UDim2.new(0, 12, 0, 50) }, Enum.EasingStyle.Back)
+end
+
+function Soc.closeView()
+	if not Soc.viewOpen then return end
+	Soc.viewOpen = false
+	tw(Soc.viewPanel, .2, { Position = UDim2.new(0, 12, 0, 44) })
+	task.delay(.22, function() if not Soc.viewOpen then Soc.viewPanel.Visible = false end end)
+end
+
+function Soc.toggleView()
+	if Soc.viewOpen then Soc.closeView() else Soc.openView() end
+end
+
+-- ── direct messages ─────────────────────────────────────────
+DM.peer = nil
+DM.W, DM.H, DM.curH = 340, 400, 400
+DM.win = mk("Frame", { Name = "DMWin", Size = UDim2.fromOffset(DM.W, DM.H), Position = UDim2.fromOffset(0, 0),
+	BackgroundColor3 = UI.C.BG, BorderSizePixel = 0, Visible = false, ClipsDescendants = true, ZIndex = 44 }, UI.layer)
+mk("UICorner", { CornerRadius = UDim.new(0, 14) }, DM.win)
+mk("UIStroke", { Thickness = 1, Color = Color3.fromRGB(96, 86, 150), Transparency = .45 }, DM.win)
+
+local dHead = mk("Frame", { Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = Color3.fromRGB(20, 20, 32),
+	BorderSizePixel = 0, Active = true, ZIndex = 45 }, DM.win)
+mk("UICorner", { CornerRadius = UDim.new(0, 14) }, dHead)
+DM.title = mk("TextLabel", { Size = UDim2.new(1, -100, 1, 0), Position = UDim2.fromOffset(12, 0),
+	BackgroundTransparency = 1, Font = Enum.Font.GothamBlack, Text = "direct message", TextSize = 11,
+	TextColor3 = UI.C.FG, TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 46 }, dHead)
+
+local dDel = mk("TextButton", { Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, -62, 0, 8),
+	BackgroundColor3 = Color3.fromRGB(38, 38, 56), BorderSizePixel = 0, AutoButtonColor = false,
+	Font = Enum.Font.GothamBold, Text = "🗑", TextSize = 10, TextColor3 = UI.C.DIM, ZIndex = 46 }, dHead)
+mk("UICorner", { CornerRadius = UDim.new(0, 7) }, dDel)
+
+local dClose = mk("TextButton", { Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, -32, 0, 8),
+	BackgroundColor3 = Color3.fromRGB(38, 38, 56), BorderSizePixel = 0, AutoButtonColor = false,
+	Font = Enum.Font.GothamBold, Text = "×", TextSize = 12, TextColor3 = UI.C.DIM, ZIndex = 46 }, dHead)
+mk("UICorner", { CornerRadius = UDim.new(0, 7) }, dClose)
+dClose.MouseButton1Click:Connect(function() DM.close() end)
+UI.makeDraggable(dHead, DM.win, DM.W, DM.H)
+
+DM.list = mk("ScrollingFrame", { Size = UDim2.new(1, -20, 1, -104), Position = UDim2.fromOffset(10, 42),
+	BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+	ScrollBarImageColor3 = Color3.fromRGB(70, 70, 100), CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y, ZIndex = 45 }, DM.win)
+mk("UIListLayout", { Padding = UDim.new(0, 6) }, DM.list)
+
+DM.comp = mk("Frame", { Size = UDim2.new(1, -20, 0, UI.TAP), Position = UDim2.new(0, 10, 1, -(UI.TAP + 10)),
+	BackgroundTransparency = 1, ZIndex = 46 }, DM.win)
+mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6),
+	VerticalAlignment = Enum.VerticalAlignment.Center }, DM.comp)
+
+local dEmo = UI.iconBtn("🙂", 1, 15, DM.comp)
+local dGif = UI.iconBtn("GIF", 2, 10, DM.comp)
+
+DM.box = mk("TextBox", { Size = UDim2.new(1, -(UI.TAP * 2 + 80), 0, UI.TAP),
+	BackgroundColor3 = Color3.fromRGB(255, 255, 255), BackgroundTransparency = .95, BorderSizePixel = 0,
+	Font = Enum.Font.Gotham, Text = "", PlaceholderText = "private message...",
+	PlaceholderColor3 = Color3.fromRGB(110, 110, 138), TextSize = 12, TextColor3 = UI.C.FG,
+	ClearTextOnFocus = false, LayoutOrder = 3, ZIndex = 46 }, DM.comp)
+mk("UICorner", { CornerRadius = UDim.new(0, 10) }, DM.box)
+mk("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, DM.box)
+
+local dSend = mk("TextButton", { Size = UDim2.fromOffset(64, UI.TAP), BackgroundColor3 = UI.C.A,
+	BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBlack, Text = "SEND",
+	TextSize = 10, TextColor3 = Color3.new(1, 1, 1), LayoutOrder = 4, ZIndex = 46 }, DM.comp)
+mk("UICorner", { CornerRadius = UDim.new(0, 10) }, dSend)
+
+function DM.snap()
+	DM.list.CanvasPosition = Vector2.new(0, math.max(0,
+		DM.list.AbsoluteCanvasSize.Y - DM.list.AbsoluteWindowSize.Y))
+end
+
+function DM.bubble(parent, mine, text, img, iw, ih, entry)
+	local row = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1,
+		AutomaticSize = Enum.AutomaticSize.Y }, parent)
+	local b = mk("Frame", { Size = UDim2.new(1, -56, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		Position = mine and UDim2.new(1, 0, 0, 0) or UDim2.new(0, 0, 0, 0),
+		AnchorPoint = mine and Vector2.new(1, 0) or Vector2.new(0, 0),
+		BackgroundColor3 = mine and Color3.fromRGB(70, 42, 140) or Color3.fromRGB(255, 255, 255),
+		BackgroundTransparency = mine and 0 or .94, BorderSizePixel = 0, ZIndex = 46 }, row)
+	mk("UICorner", { CornerRadius = UDim.new(0, 10) }, b)
+	mk("UIPadding", { PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5),
+		PaddingLeft = UDim.new(0, 9), PaddingRight = UDim.new(0, 9) }, b)
+	if #(text or "") > 0 then
+		mk("TextLabel", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+			Text = text, TextSize = 12, TextWrapped = true, AutomaticSize = Enum.AutomaticSize.Y,
+			TextColor3 = Color3.fromRGB(231, 229, 242), TextXAlignment = Enum.TextXAlignment.Left,
+			ZIndex = 47 }, b)
+	end
+	if img then
+		local s = math.min(200 / (iw or 200), 160 / (ih or 150), 1)
+		local im = mk("ImageLabel", { Size = UDim2.fromOffset((iw or 200) * s, (ih or 150) * s),
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255), BackgroundTransparency = .92,
+			BorderSizePixel = 0, ScaleType = Enum.ScaleType.Fit, ZIndex = 47 }, b)
+		mk("UICorner", { CornerRadius = UDim.new(0, 8) }, im)
+		Q.attach(im, { img }, false)
+	end
+	if entry then
+		local del = mk("TextButton", { Size = UDim2.fromOffset(16, 16),
+			Position = mine and UDim2.new(0, 0, 0, 0) or UDim2.new(1, 0, 0, 0),
+			AnchorPoint = mine and Vector2.new(0, 0) or Vector2.new(1, 0),
+			BackgroundColor3 = Color3.fromRGB(40, 38, 58), BackgroundTransparency = .35,
+			BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBold,
+			Text = "×", TextSize = 11, TextColor3 = Color3.fromRGB(200, 195, 220), ZIndex = 48 }, row)
+		mk("UICorner", { CornerRadius = UDim.new(0, 5) }, del)
+		del.MouseButton1Click:Connect(function() DM.delMsg(entry) end)
+	end
+	return b
+end
+
+function DM.render()
+	if not DM.win.Visible then return end
+	for _, c in ipairs(DM.list:GetChildren()) do
+		if c:IsA("GuiObject") then c:Destroy() end
+	end
+	local p = Soc.peers[lc(DM.peer or "")]
+	if not p then return end
+	DM.title.Text = p.n
+	if #p.msgs == 0 then
+		mk("TextLabel", { Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+			Text = "no messages yet — say hi", TextSize = 10, TextColor3 = UI.C.DIM,
+			TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 46 }, DM.list)
+	end
+	for _, e in ipairs(p.msgs) do
+		local mine = (e.u == plr.Name)
+		local b = DM.bubble(DM.list, mine, e.m or "", e.img, e.iw, e.ih, e)
+		if e.sys == "ginv" then
+			local t = b:FindFirstChildOfClass("TextLabel")
+			if t then t.TextColor3 = UI.C.WARN end
+		end
+	end
+	DM.snap()
+end
+
+function DM.delMsg(entry)
+	local p = Soc.peers[lc(DM.peer or "")]
+	if not p or not entry then return end
+	for i = #p.msgs, 1, -1 do
+		if p.msgs[i] == entry then table.remove(p.msgs, i); break end
+	end
+	Soc.saveNow()
+	DM.render()
+	if DM.listOpen then DM.renderList() end
+end
+
+function DM.delete(name)
+	local key = lc(name or "")
+	if not Soc.peers[key] then return end
+	Soc.peers[key] = nil
+	for i, k in ipairs(Soc.peerOrder) do
+		if k == key then table.remove(Soc.peerOrder, i); break end
+	end
+	if DM.peer and lc(DM.peer) == key then DM.close() end
+	Soc.saveNow()
+	DM.renderList()
+	DM.badge()
+	H.flash("Deleted chat with " .. name, UI.C.OKC)
+end
+
+function DM.open(name, uid)
+	if not name or name == "" then return end
+	Card.close(); Soc.closeView(); Grp.closeList(); Grp.closeWin(); Pan.close(); Pan.closeOwner()
+	local p = Soc.peer(name, uid)
+	p.unread = 0
+	DM.peer = name
+	DM.win.Visible = true
+	DM.curH = select(2, UI.dockWin(DM.win, DM.W, DM.H))
+	DM.render()
+	DM.badge()
+	Soc.save()
+	if not UI.isTouch then pcall(function() DM.box:CaptureFocus() end) end
+end
+
+function DM.close()
+	DM.win.Visible = false
+	DM.peer = nil
+	if Pan.target == "dm" then Pan.close() end
+end
+
+function DM.send(text, img, iw, ih)
+	local peer = DM.peer
+	if not peer then return end
+	text = text or ""
+	if #text == 0 and not img then return end
+	local p = Soc.peer(peer)
+	if img then text = "" else text = utf8Cut(UI.convert(text), 220); DM.box.Text = "" end
+	p.msgs[#p.msgs + 1] = { u = plr.Name, m = text, t = Cfg.now(), img = img, iw = iw, ih = ih }
+	while #p.msgs > 200 do table.remove(p.msgs, 1) end
+	p.t = Cfg.now()
+	Soc.save()
+	DM.render()
+	Link.post(Link.dmTopic(peer), { from = plr.Name, fromid = plr.UserId, m = text,
+		img = img, w = iw, h = ih, t = Cfg.now() })
+	if DM.listOpen then DM.renderList() end
+end
+dSend.MouseButton1Click:Connect(function() DM.send(DM.box.Text) end)
+DM.box.FocusLost:Connect(function(enter) if enter then DM.send(DM.box.Text) end end)
+dEmo.MouseButton1Click:Connect(function() Pan.open("emoji", "dm") end)
+dGif.MouseButton1Click:Connect(function() Pan.open("gif", "dm") end)
+
+DM.delArmed, DM.delTok = false, 0
+dDel.MouseButton1Click:Connect(function()
+	if not DM.peer then return end
+	if not DM.delArmed then
+		DM.delArmed = true
+		DM.delTok = DM.delTok + 1
+		local tok = DM.delTok
+		dDel.BackgroundColor3 = UI.C.BADC
+		dDel.BackgroundTransparency = .2
+		dDel.Text = "!"
+		task.delay(2.5, function()
+			if tok == DM.delTok then
+				DM.delArmed = false
+				dDel.BackgroundColor3 = Color3.fromRGB(38, 38, 56)
+				dDel.BackgroundTransparency = 0
+				dDel.Text = "🗑"
+			end
+		end)
+		return
+	end
+	DM.delArmed = false
+	DM.delTok = DM.delTok + 1
+	dDel.BackgroundColor3 = Color3.fromRGB(38, 38, 56)
+	dDel.BackgroundTransparency = 0
+	dDel.Text = "🗑"
+	DM.delete(DM.peer)
+end)
+
+function DM.recv(data)
+	local from = data.from
+	if type(from) ~= "string" or #from == 0 then return end
+	if data.sys == "ginv" then Grp.invited(data) end
+	local p = Soc.peer(from, tonumber(data.fromid))
+	p.msgs[#p.msgs + 1] = { u = from, m = tostring(data.m or ""), t = tonumber(data.t) or Cfg.now(),
+		sys = data.sys, img = type(data.img) == "string" and data.img or nil,
+		iw = tonumber(data.w), ih = tonumber(data.h) }
+	while #p.msgs > 200 do table.remove(p.msgs, 1) end
+	p.t = Cfg.now()
+	local open = DM.win.Visible and DM.peer and lc(DM.peer) == lc(from)
+	if open then
+		p.unread = 0
+		DM.render()
+	else
+		p.unread = (p.unread or 0) + 1
+		H.flash("DM from " .. from, UI.C.OKC)
+	end
+	DM.badge()
+	Soc.save()
+	if DM.listOpen then DM.renderList() end
+end
+
+function DM.badge()
+	if not DM.btn then return end
+	local n = 0
+	for _, p in pairs(Soc.peers) do n = n + (p.unread or 0) end
+	DM.btn.Text = n > 0 and ("✉" .. (n > 9 and "+" or tostring(n))) or "✉"
+	DM.btn.TextColor3 = n > 0 and UI.C.OKC or UI.C.DIM
+end
+
+DM.listOpen = false
+DM.panel = mk("Frame", { Size = UDim2.new(1, -24, 1, -56), Position = UDim2.new(0, 12, 0, 50),
+	BackgroundColor3 = Color3.fromRGB(18, 17, 30), BorderSizePixel = 0, Visible = false, ZIndex = 30 }, UI.cg)
+mk("UICorner", { CornerRadius = UDim.new(0, 14) }, DM.panel)
+mk("UIPadding", { PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 12),
+	PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }, DM.panel)
+mk("TextLabel", { Size = UDim2.new(1, -30, 0, 18), BackgroundTransparency = 1, Font = Enum.Font.GothamBlack,
+	Text = "DIRECT MESSAGES", TextSize = 11, TextColor3 = Color3.fromRGB(216, 207, 251),
+	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31 }, DM.panel)
+local dlClose = mk("TextButton", { Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, 0, 0, -2),
+	BackgroundColor3 = Color3.fromRGB(38, 38, 56), BorderSizePixel = 0, AutoButtonColor = false,
+	Font = Enum.Font.GothamBold, Text = "×", TextSize = 12, TextColor3 = UI.C.DIM, ZIndex = 31 }, DM.panel)
+mk("UICorner", { CornerRadius = UDim.new(0, 7) }, dlClose)
+dlClose.MouseButton1Click:Connect(function() DM.closeList() end)
+
+DM.newBox = mk("TextBox", { Size = UDim2.new(1, -70, 0, 28), Position = UDim2.fromOffset(0, 26),
+	BackgroundColor3 = Color3.fromRGB(255, 255, 255), BackgroundTransparency = .95, BorderSizePixel = 0,
+	Font = Enum.Font.Gotham, Text = "", PlaceholderText = "username to message",
+	PlaceholderColor3 = Color3.fromRGB(110, 110, 138), TextSize = 11, TextColor3 = UI.C.FG,
+	TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, ZIndex = 31 }, DM.panel)
+mk("UICorner", { CornerRadius = UDim.new(0, 9) }, DM.newBox)
+mk("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, DM.newBox)
+
+local dmGo = mk("TextButton", { Size = UDim2.fromOffset(64, 28), Position = UDim2.new(1, -64, 0, 26),
+	BackgroundColor3 = UI.C.A, BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBlack,
+	Text = "OPEN", TextSize = 10, TextColor3 = Color3.new(1, 1, 1), ZIndex = 31 }, DM.panel)
+mk("UICorner", { CornerRadius = UDim.new(0, 9) }, dmGo)
+
+DM.scroll = mk("ScrollingFrame", { Size = UDim2.new(1, 0, 1, -62), Position = UDim2.fromOffset(0, 60),
+	BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+	ScrollBarImageColor3 = Color3.fromRGB(70, 70, 100), CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y, ZIndex = 32 }, DM.panel)
+DM.rows = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1,
+	AutomaticSize = Enum.AutomaticSize.Y }, DM.scroll)
+mk("UIListLayout", { Padding = UDim.new(0, 4) }, DM.rows)
+
+function DM.renderList()
+	if not DM.listOpen then return end
+	DM.rows:ClearAllChildren()
+	mk("UIListLayout", { Padding = UDim.new(0, 4) }, DM.rows)
+	local keys = {}
+	for k, p in pairs(Soc.peers) do keys[#keys + 1] = { k = k, p = p } end
+	table.sort(keys, function(a, b) return (a.p.t or 0) > (b.p.t or 0) end)
+	if #keys == 0 then
+		mk("TextLabel", { Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+			Text = "no conversations yet", TextSize = 10, TextColor3 = UI.C.DIM,
+			TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 33 }, DM.rows)
+		return
+	end
+	for _, e in ipairs(keys) do
+		local p = e.p
+		local row = mk("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1, ZIndex = 32 }, DM.rows)
+		local av = mk("ImageLabel", { Size = UDim2.fromOffset(26, 26), Position = UDim2.fromOffset(0, 3),
+			BackgroundColor3 = Color3.fromRGB(45, 42, 66), BorderSizePixel = 0, Image = "",
+			ImageTransparency = 1, ZIndex = 34 }, row)
+		mk("UICorner", { CornerRadius = UDim.new(1, 0) }, av)
+		UI.loadAvatar(av, p.uid, p.n)
+		mk("TextLabel", { Size = UDim2.new(1, -112, 0, 13), Position = UDim2.fromOffset(32, 3),
+			BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = p.n, TextSize = 10.5,
+			TextColor3 = UI.C.FG, TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 33 }, row)
+		local last = p.msgs[#p.msgs]
+		local snippet = last and (#last.m > 0 and last.m or "[gif]") or "—"
+		mk("TextLabel", { Size = UDim2.new(1, -112, 0, 12), Position = UDim2.fromOffset(32, 17),
+			BackgroundTransparency = 1, Font = Enum.Font.Gotham, Text = snippet, TextSize = 9.5,
+			TextColor3 = UI.C.DIM, TextTruncate = Enum.TextTruncate.AtEnd,
+			TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 33 }, row)
+		if (p.unread or 0) > 0 then
+			mk("Frame", { Size = UDim2.fromOffset(7, 7), Position = UDim2.new(1, -46, 0, 13),
+				BackgroundColor3 = UI.C.OKC, BorderSizePixel = 0, ZIndex = 34 }, row)
+			row.BackgroundColor3 = Color3.fromRGB(28, 26, 44)
+		end
+		local hit = mk("TextButton", { Size = UDim2.new(1, -34, 1, 0), BackgroundTransparency = 1,
+			BorderSizePixel = 0, Text = "", ZIndex = 35 }, row)
+		hit.MouseButton1Click:Connect(function() DM.open(p.n, p.uid) end)
+
+		local del = mk("TextButton", { Size = UDim2.fromOffset(24, 24), Position = UDim2.new(1, -26, 0, 5),
+			BackgroundColor3 = Color3.fromRGB(120, 56, 66), BackgroundTransparency = .35,
+			BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBold,
+			Text = "×", TextSize = 12, TextColor3 = Color3.new(1, 1, 1), ZIndex = 36 }, row)
+		mk("UICorner", { CornerRadius = UDim.new(0, 7) }, del)
+		local armed, tok = false, 0
+		del.MouseButton1Click:Connect(function()
+			if not armed then
+				armed = true
+				tok = tok + 1
+				local t = tok
+				del.BackgroundTransparency = 0
+				del.Text = "✓"
+				task.delay(2, function()
+					if t == tok then
+						armed = false
+						del.BackgroundTransparency = .35
+						del.Text = "×"
+					end
+				end)
+				return
+			end
+			armed = false
+			tok = tok + 1
+			DM.delete(p.n)
+		end)
+	end
+end
+
+function DM.openList()
+	Soc.closeAll(); Pan.close(); Pan.closeOwner()
+	DM.listOpen = true
+	DM.panel.Visible = true
+	DM.panel.Position = UDim2.new(0, 12, 0, 44)
+	DM.renderList()
+	tw(DM.panel, .3, { Position = UDim2.new(0, 12, 0, 50) }, Enum.EasingStyle.Back)
+end
+
+function DM.closeList()
+	if not DM.listOpen then return end
+	DM.listOpen = false
+	tw(DM.panel, .2, { Position = UDim2.new(0, 12, 0, 44) })
+	task.delay(.22, function() if not DM.listOpen then DM.panel.Visible = false end end)
+end
+
+function DM.toggleList()
+	if DM.listOpen then DM.closeList() else DM.openList() end
+end
+
+local function dmGoName()
+	local n = DM.newBox.Text:gsub("%s", "")
+	if #n == 0 then return end
+	DM.newBox.Text = ""
+	DM.open(n)
+end
+dmGo.MouseButton1Click:Connect(dmGoName)
+DM.newBox.FocusLost:Connect(function(enter) if enter then dmGoName() end end)
+
+-- ── groups ──────────────────────────────────────────────────
+Grp.winOpen, Grp.listOpen, Grp.code = false, false, nil
+Grp.W, Grp.H, Grp.curH = 360, 420, 420
+Grp.btn = nil
+
+Grp.panel = mk("Frame", { Size = UDim2.new(1, -24, 1, -56), Position = UDim2.new(0, 12, 0, 50),
+	BackgroundColor3 = Color3.fromRGB(18, 17, 30), BorderSizePixel = 0, Visible = false, ZIndex = 30 }, UI.cg)
+mk("UICorner", { CornerRadius = UDim.new(0, 14) }, Grp.panel)
+mk("UIPadding", { PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 12),
+	PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }, Grp.panel)
+mk("TextLabel", { Size = UDim2.new(1, -30, 0, 18), BackgroundTransparency = 1, Font = Enum.Font.GothamBlack,
+	Text = "GROUPS  ·  max " .. Soc.GROUP_MAX, TextSize = 11, TextColor3 = Color3.fromRGB(216, 207, 251),
+	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31 }, Grp.panel)
+local glClose = mk("TextButton", { Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, 0, 0, -2),
+	BackgroundColor3 = Color3.fromRGB(38, 38, 56), BorderSizePixel = 0, AutoButtonColor = false,
+	Font = Enum.Font.GothamBold, Text = "×", TextSize = 12, TextColor3 = UI.C.DIM, ZIndex = 31 }, Grp.panel)
+mk("UICorner", { CornerRadius = UDim.new(0, 7) }, glClose)
+glClose.MouseButton1Click:Connect(function() Grp.closeList() end)
+
+Grp.nameBox = mk("TextBox", { Size = UDim2.new(1, -80, 0, 28), Position = UDim2.fromOffset(0, 26),
+	BackgroundColor3 = Color3.fromRGB(255, 255, 255), BackgroundTransparency = .95, BorderSizePixel = 0,
+	Font = Enum.Font.Gotham, Text = "", PlaceholderText = "new group name",
+	PlaceholderColor3 = Color3.fromRGB(110, 110, 138), TextSize = 11, TextColor3 = UI.C.FG,
+	TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, ZIndex = 31 }, Grp.panel)
+mk("UICorner", { CornerRadius = UDim.new(0, 9) }, Grp.nameBox)
+mk("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, Grp.nameBox)
+
+local gCreate = mk("TextButton", { Size = UDim2.fromOffset(74, 28), Position = UDim2.new(1, -74, 0, 26),
+	BackgroundColor3 = UI.C.A, BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBlack,
+	Text = "CREATE", TextSize = 10, TextColor3 = Color3.new(1, 1, 1), ZIndex = 31 }, Grp.panel)
+mk("UICorner", { CornerRadius = UDim.new(0, 9) }, gCreate)
+
+Grp.scroll = mk("ScrollingFrame", { Size = UDim2.new(1, 0, 1, -62), Position = UDim2.fromOffset(0, 60),
+	BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+	ScrollBarImageColor3 = Color3.fromRGB(70, 70, 100), CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y, ZIndex = 32 }, Grp.panel)
+Grp.rows = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1,
+	AutomaticSize = Enum.AutomaticSize.Y }, Grp.scroll)
+mk("UIListLayout", { Padding = UDim.new(0, 4) }, Grp.rows)
+
+function Grp.renderList()
+	if not Grp.listOpen then return end
+	Grp.rows:ClearAllChildren()
+	mk("UIListLayout", { Padding = UDim.new(0, 4) }, Grp.rows)
+	local any = false
+	for code, g in pairs(Soc.groups) do
+		any = true
+		local row = mk("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1, ZIndex = 32 }, Grp.rows)
+		mk("TextLabel", { Size = UDim2.new(1, -40, 0, 13), Position = UDim2.fromOffset(0, 3),
+			BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = g.name, TextSize = 10.5,
+			TextColor3 = UI.C.FG, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 33 }, row)
+		mk("TextLabel", { Size = UDim2.new(1, -40, 0, 12), Position = UDim2.fromOffset(0, 17),
+			BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+			Text = #g.members .. " / " .. Soc.GROUP_MAX .. " members", TextSize = 9.5,
+			TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 33 }, row)
+		local leave = mk("TextButton", { Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, -22, 0, 6),
+			BackgroundColor3 = UI.C.BADC, BackgroundTransparency = .25, BorderSizePixel = 0,
+			AutoButtonColor = false, Font = Enum.Font.GothamBold, Text = "×", TextSize = 12,
+			TextColor3 = Color3.new(1, 1, 1), ZIndex = 34 }, row)
+		mk("UICorner", { CornerRadius = UDim.new(0, 7) }, leave)
+		leave.MouseButton1Click:Connect(function() Grp.leave(code) end)
+		local hit = mk("TextButton", { Size = UDim2.new(1, -30, 1, 0), BackgroundTransparency = 1,
+			BorderSizePixel = 0, Text = "", ZIndex = 33 }, row)
+		hit.MouseButton1Click:Connect(function() Grp.openWin(code) end)
+	end
+	if not any then
+		mk("TextLabel", { Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+			Text = "no groups yet — create one, then invite from inside it", TextSize = 10,
+			TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 33 }, Grp.rows)
+	end
+end
+
+function Grp.create()
+	local n = Grp.nameBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+	if #n == 0 then return end
+	if #n > 32 then n = utf8Cut(n, 32) end
+	Grp.nameBox.Text = ""
+	local code = Link.slug(n) .. "_" .. string.format("%x", (os.time() + math.random(0, 9999)) % 1048576)
+	Soc.groups[code] = { code = code, name = n, owner = plr.Name, members = { plr.Name } }
+	Soc.gmsgs[code] = {}
+	Soc.save()
+	Grp.renderList()
+	Grp.openWin(code)
+	H.flash("Group created", UI.C.OKC)
+end
+gCreate.MouseButton1Click:Connect(Grp.create)
+Grp.nameBox.FocusLost:Connect(function(enter) if enter then Grp.create() end end)
+
+function Grp.invited(data)
+	local code = tostring(data.code or "")
+	local name = tostring(data.name or "group")
+	local from = tostring(data.from or "?")
+	if #code == 0 or Soc.groups[code] then return end
+	Soc.groups[code] = { code = code, name = name, owner = from, members = { plr.Name, from } }
+	Soc.gmsgs[code] = {}
+	Soc.save()
+	H.flash("Added to group " .. name, UI.C.OKC)
+	if Grp.listOpen then Grp.renderList() end
+end
+
+function Grp.leave(code)
+	local g = Soc.groups[code]
+	if not g then return end
+	Soc.groups[code] = nil
+	Soc.gmsgs[code] = nil
+	Link.unregister("grp_" .. code)
+	if Grp.code == code then Grp.closeWin() end
+	Soc.save()
+	Grp.renderList()
+end
+
+Grp.win = mk("Frame", { Name = "GrpWin", Size = UDim2.fromOffset(Grp.W, Grp.H), Position = UDim2.fromOffset(0, 0),
+	BackgroundColor3 = UI.C.BG, BorderSizePixel = 0, Visible = false, ClipsDescendants = true, ZIndex = 44 }, UI.layer)
+mk("UICorner", { CornerRadius = UDim.new(0, 14) }, Grp.win)
+mk("UIStroke", { Thickness = 1, Color = Color3.fromRGB(96, 86, 150), Transparency = .45 }, Grp.win)
+
+local gHead = mk("Frame", { Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = Color3.fromRGB(20, 20, 32),
+	BorderSizePixel = 0, Active = true, ZIndex = 45 }, Grp.win)
+mk("UICorner", { CornerRadius = UDim.new(0, 14) }, gHead)
+Grp.title = mk("TextLabel", { Size = UDim2.new(1, -110, 1, 0), Position = UDim2.fromOffset(12, 0),
+	BackgroundTransparency = 1, Font = Enum.Font.GothamBlack, Text = "group", TextSize = 11,
+	TextColor3 = UI.C.FG, TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 46 }, gHead)
+Grp.count = mk("TextLabel", { Size = UDim2.fromOffset(52, 1), Position = UDim2.new(1, -92, 0, 0),
+	BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "", TextSize = 9,
+	TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Right, ZIndex = 46 }, gHead)
+
+local gInv = mk("TextButton", { Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, -62, 0, 8),
+	BackgroundColor3 = Color3.fromRGB(38, 38, 56), BorderSizePixel = 0, AutoButtonColor = false,
+	Font = Enum.Font.GothamBlack, Text = "+", TextSize = 13, TextColor3 = UI.C.DIM, ZIndex = 46 }, gHead)
+mk("UICorner", { CornerRadius = UDim.new(0, 7) }, gInv)
+
+local gClose = mk("TextButton", { Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, -32, 0, 8),
+	BackgroundColor3 = Color3.fromRGB(38, 38, 56), BorderSizePixel = 0, AutoButtonColor = false,
+	Font = Enum.Font.GothamBold, Text = "×", TextSize = 12, TextColor3 = UI.C.DIM, ZIndex = 46 }, gHead)
+mk("UICorner", { CornerRadius = UDim.new(0, 7) }, gClose)
+gClose.MouseButton1Click:Connect(function() Grp.closeWin() end)
+UI.makeDraggable(gHead, Grp.win, Grp.W, Grp.H)
+
+Grp.members = mk("TextLabel", { Size = UDim2.new(1, -20, 0, 14), Position = UDim2.fromOffset(10, 40),
+	BackgroundTransparency = 1, Font = Enum.Font.Gotham, Text = "", TextSize = 9,
+	TextColor3 = UI.C.DIM, TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 45 }, Grp.win)
+
+Grp.invRow = mk("Frame", { Size = UDim2.new(1, -20, 0, 28), Position = UDim2.fromOffset(10, 56),
+	BackgroundTransparency = 1, Visible = false, ZIndex = 46 }, Grp.win)
+Grp.invBox = mk("TextBox", { Size = UDim2.new(1, -70, 1, 0), BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+	BackgroundTransparency = .95, BorderSizePixel = 0, Font = Enum.Font.Gotham, Text = "",
+	PlaceholderText = "username to invite", PlaceholderColor3 = Color3.fromRGB(110, 110, 138),
+	TextSize = 11, TextColor3 = UI.C.FG, ClearTextOnFocus = false, ZIndex = 47 }, Grp.invRow)
+mk("UICorner", { CornerRadius = UDim.new(0, 9) }, Grp.invBox)
+mk("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, Grp.invBox)
+local gInvGo = mk("TextButton", { Size = UDim2.fromOffset(64, 28), Position = UDim2.new(1, -64, 0, 0),
+	BackgroundColor3 = UI.C.A, BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBlack,
+	Text = "INVITE", TextSize = 10, TextColor3 = Color3.new(1, 1, 1), ZIndex = 47 }, Grp.invRow)
+mk("UICorner", { CornerRadius = UDim.new(0, 9) }, gInvGo)
+
+Grp.list = mk("ScrollingFrame", { Size = UDim2.new(1, -20, 1, -136), Position = UDim2.fromOffset(10, 74),
+	BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+	ScrollBarImageColor3 = Color3.fromRGB(70, 70, 100), CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y, ZIndex = 45 }, Grp.win)
+mk("UIListLayout", { Padding = UDim.new(0, 6) }, Grp.list)
+
+Grp.comp = mk("Frame", { Size = UDim2.new(1, -20, 0, UI.TAP), Position = UDim2.new(0, 10, 1, -(UI.TAP + 10)),
+	BackgroundTransparency = 1, ZIndex = 46 }, Grp.win)
+mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6),
+	VerticalAlignment = Enum.VerticalAlignment.Center }, Grp.comp)
+
+local gEmo = UI.iconBtn("🙂", 1, 15, Grp.comp)
+local gGif = UI.iconBtn("GIF", 2, 10, Grp.comp)
+
+Grp.box = mk("TextBox", { Size = UDim2.new(1, -(UI.TAP * 2 + 80), 0, UI.TAP),
+	BackgroundColor3 = Color3.fromRGB(255, 255, 255), BackgroundTransparency = .95, BorderSizePixel = 0,
+	Font = Enum.Font.Gotham, Text = "", PlaceholderText = "message the group...",
+	PlaceholderColor3 = Color3.fromRGB(110, 110, 138), TextSize = 12, TextColor3 = UI.C.FG,
+	ClearTextOnFocus = false, LayoutOrder = 3, ZIndex = 46 }, Grp.comp)
+mk("UICorner", { CornerRadius = UDim.new(0, 10) }, Grp.box)
+mk("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, Grp.box)
+
+local gSend = mk("TextButton", { Size = UDim2.fromOffset(64, UI.TAP), BackgroundColor3 = UI.C.A,
+	BorderSizePixel = 0, AutoButtonColor = false, Font = Enum.Font.GothamBlack, Text = "SEND",
+	TextSize = 10, TextColor3 = Color3.new(1, 1, 1), LayoutOrder = 4, ZIndex = 46 }, Grp.comp)
+mk("UICorner", { CornerRadius = UDim.new(0, 10) }, gSend)
+
+function Grp.render()
+	if not Grp.winOpen then return end
+	local g = Soc.groups[Grp.code]
+	if not g then return end
+	Grp.title.Text = g.name
+	Grp.count.Text = #g.members .. "/" .. Soc.GROUP_MAX
+	Grp.members.Text = table.concat(g.members, " · ")
+	for _, c in ipairs(Grp.list:GetChildren()) do
+		if c:IsA("GuiObject") then c:Destroy() end
+	end
+	for _, e in ipairs(Soc.gmsgs[Grp.code] or {}) do
+		local mine = (e.u == plr.Name)
+		local row = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1,
+			AutomaticSize = Enum.AutomaticSize.Y }, Grp.list)
+		local b = mk("Frame", { Size = UDim2.new(1, -60, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+			Position = mine and UDim2.new(1, 0, 0, 0) or UDim2.new(0, 0, 0, 0),
+			AnchorPoint = mine and Vector2.new(1, 0) or Vector2.new(0, 0),
+			BackgroundColor3 = mine and Color3.fromRGB(70, 42, 140) or Color3.fromRGB(255, 255, 255),
+			BackgroundTransparency = mine and 0 or .94, BorderSizePixel = 0, ZIndex = 46 }, row)
+		mk("UICorner", { CornerRadius = UDim.new(0, 10) }, b)
+		mk("UIPadding", { PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5),
+			PaddingLeft = UDim.new(0, 9), PaddingRight = UDim.new(0, 9) }, b)
+		if not mine then
+			mk("TextLabel", { Size = UDim2.new(1, 0, 0, 10), BackgroundTransparency = 1,
+				Font = Enum.Font.GothamBold, Text = string.upper(e.u), TextSize = 8,
+				TextColor3 = Color3.fromRGB(139, 134, 168), TextXAlignment = Enum.TextXAlignment.Left,
+				ZIndex = 47 }, b)
+		end
+		if #(e.m or "") > 0 then
+			mk("TextLabel", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+				Text = e.m, TextSize = 12, TextWrapped = true, AutomaticSize = Enum.AutomaticSize.Y,
+				TextColor3 = Color3.fromRGB(231, 229, 242), TextXAlignment = Enum.TextXAlignment.Left,
+				ZIndex = 47 }, b)
+		end
+		if e.img then
+			local s = math.min(200 / (e.iw or 200), 160 / (e.ih or 150), 1)
+			local im = mk("ImageLabel", { Size = UDim2.fromOffset((e.iw or 200) * s, (e.ih or 150) * s),
+				BackgroundColor3 = Color3.fromRGB(255, 255, 255), BackgroundTransparency = .92,
+				BorderSizePixel = 0, ScaleType = Enum.ScaleType.Fit, ZIndex = 47 }, b)
+			mk("UICorner", { CornerRadius = UDim.new(0, 8) }, im)
+			Q.attach(im, { e.img }, false)
+		end
+	end
+	Grp.list.CanvasPosition = Vector2.new(0, math.max(0,
+		Grp.list.AbsoluteCanvasSize.Y - Grp.list.AbsoluteWindowSize.Y))
+end
+
+function Grp.recv(code, data)
+	local u = tostring(data.u or "?")
+	if u == plr.Name then return end
+	local list = Soc.gmsgs[code]
+	if not list then return end
+	list[#list + 1] = { u = u, m = tostring(data.m or ""), t = tonumber(data.t) or Cfg.now(),
+		img = type(data.img) == "string" and data.img or nil, iw = tonumber(data.w), ih = tonumber(data.h) }
+	while #list > 200 do table.remove(list, 1) end
+	Soc.save()
+	if Grp.winOpen and Grp.code == code then Grp.render() end
+end
+
+function Grp.openWin(code)
+	local g = Soc.groups[code]
+	if not g then return end
+	Soc.closeAll(); Pan.close(); Pan.closeOwner()
+	Grp.code = code
+	Grp.winOpen = true
+	Grp.win.Visible = true
+	Grp.curH = select(2, UI.dockWin(Grp.win, Grp.W, Grp.H))
+	Link.register("grp_" .. code, Link.grpTopic(code), function(data) Grp.recv(code, data) end)
+	Grp.render()
+	if not UI.isTouch then pcall(function() Grp.box:CaptureFocus() end) end
+end
+
+function Grp.closeWin()
+	if not Grp.winOpen then return end
+	if Grp.code then Link.unregister("grp_" .. Grp.code) end
+	Grp.winOpen = false
+	Grp.win.Visible = false
+	Grp.code = nil
+	if Pan.target == "grp" then Pan.close() end
+end
+
+function Grp.send(text, img, iw, ih)
+	local code = Grp.code
+	local g = Soc.groups[code]
+	if not g then return end
+	text = text or ""
+	if #text == 0 and not img then return end
+	if img then text = "" else text = utf8Cut(UI.convert(text), 220); Grp.box.Text = "" end
+	local list = Soc.gmsgs[code]
+	list[#list + 1] = { u = plr.Name, m = text, t = Cfg.now(), img = img, iw = iw, ih = ih }
+	while #list > 200 do table.remove(list, 1) end
+	Soc.save()
+	Grp.render()
+	Link.post(Link.grpTopic(code), { u = plr.Name, uid = plr.UserId, m = text,
+		img = img, w = iw, h = ih, t = Cfg.now() })
+end
+gSend.MouseButton1Click:Connect(function() Grp.send(Grp.box.Text) end)
+Grp.box.FocusLost:Connect(function(enter) if enter then Grp.send(Grp.box.Text) end end)
+gEmo.MouseButton1Click:Connect(function() Pan.open("emoji", "grp") end)
+gGif.MouseButton1Click:Connect(function() Pan.open("gif", "grp") end)
+
+local function grpInvite()
+	local g = Soc.groups[Grp.code]
+	if not g then return end
+	local n = Grp.invBox.Text:gsub("%s", "")
+	if #n == 0 then return end
+	Grp.invBox.Text = ""
+	if #g.members >= Soc.GROUP_MAX then H.flash("Group is full (30)", UI.C.BADC); return end
+	if inList(g.members, n) then H.flash(n .. " is already in the group", UI.C.BADC); return end
+	g.members[#g.members + 1] = n
+	Soc.save()
+	Grp.render()
+	Link.post(Link.dmTopic(n), { from = plr.Name, fromid = plr.UserId, sys = "ginv",
+		code = g.code, name = g.name, m = plr.Name .. " invited you to the group " .. g.name, t = Cfg.now() })
+	H.flash("Invited " .. n, UI.C.OKC)
+end
+gInvGo.MouseButton1Click:Connect(grpInvite)
+Grp.invBox.FocusLost:Connect(function(enter) if enter then grpInvite() end end)
+gInv.MouseButton1Click:Connect(function()
+	Grp.invRow.Visible = not Grp.invRow.Visible
+	if Grp.invRow.Visible and not UI.isTouch then pcall(function() Grp.invBox:CaptureFocus() end) end
+end)
+
+function Grp.openList()
+	Soc.closeAll(); Pan.close(); Pan.closeOwner()
+	Grp.listOpen = true
+	Grp.panel.Visible = true
+	Grp.panel.Position = UDim2.new(0, 12, 0, 44)
+	Grp.renderList()
+	tw(Grp.panel, .3, { Position = UDim2.new(0, 12, 0, 50) }, Enum.EasingStyle.Back)
+end
+
+function Grp.closeList()
+	if not Grp.listOpen then return end
+	Grp.listOpen = false
+	tw(Grp.panel, .2, { Position = UDim2.new(0, 12, 0, 44) })
+	task.delay(.22, function() if not Grp.listOpen then Grp.panel.Visible = false end end)
+end
+
+function Grp.toggleList()
+	if Grp.listOpen then Grp.closeList() else Grp.openList() end
+end
+
+function Soc.closeAll()
+	Card.close()
+	DM.close()
+	DM.closeList()
+	Grp.closeWin()
+	Grp.closeList()
+	Soc.closeView()
+end
+
+-- ── nav buttons + social boot ───────────────────────────────
+DM.btn = UI.ctrl("✉", -144)
+Grp.btn = UI.ctrl("👥", -116)
+local profBtn = UI.ctrl("👤", -172)
+DM.btn.MouseButton1Click:Connect(DM.toggleList)
+Grp.btn.MouseButton1Click:Connect(Grp.toggleList)
+profBtn.MouseButton1Click:Connect(Soc.toggleView)
+
+Soc.load()
+DM.badge()
+Soc.syncMine()
+
+task.spawn(function()
+	task.wait(1.2)
+	if not running then return end
+	Link.register("inbox", Link.dmTopic(plr.Name), DM.recv)
+	Soc.lastPub = 0
+	Soc.publish()
+end)
+
+task.spawn(function()
+	while running and gui.Parent do
+		task.wait(45)
+		if running and gui.Parent then Soc.lastPub = 0; Soc.publish() end
+	end
+end)
+
+-- ╔══════════════════════════════════════════════════════════╗
+-- ║  COMPOSER                                                ║
+-- ╚══════════════════════════════════════════════════════════╝
+T.replyTo = nil
+
+function T.setReply(e)
+	if not e then return end
+	T.replyTo = e
+	UI.replyName.Text = string.upper(e.u or "?")
+	UI.replyText.Text = (#(e.m or "") > 0) and e.m or "[gif]"
+	UI.setReply(true)
+end
+
+function T.clearReply()
+	T.replyTo = nil
+	UI.setReply(false)
+end
+UI.replyX.MouseButton1Click:Connect(T.clearReply)
+
+function T.publish(text, img, iw, ih)
+	text = text or ""
+	if #text == 0 and not img then return end
+	local now = os.clock()
+	if Cfg.slow > 0 and not Cfg.me then
+		local wait = Cfg.slow - (now - Cfg.lastSend)
+		if wait > 0 then
+			H.flash(string.format("slow mode: wait %.1fs", wait), UI.C.WARN)
+			return
+		end
+	end
+	if not img then
+		text = utf8Cut(UI.convert(text), 220)
+		UI.box.Text = ""
+	end
+	local cid = string.format("%d-%x", plr.UserId or 0, math.random(1, 0x7FFFFFFF))
+	Net.markSent(cid)
+	Cfg.lastSend = now
+	local r = nil
+	if T.replyTo then
+		r = { id = T.replyTo.id, u = T.replyTo.u, m = T.replyTo.m }
+		T.clearReply()
+	end
+	local stamp = Cfg.now()
+	local payload = { cid = cid, u = plr.Name, uid = plr.UserId, g = Net.gameName,
+		m = text, img = img, w = iw, h = ih, t = stamp, r = r }
+	V.push({ id = cid, u = plr.Name, uid = plr.UserId, g = Net.gameName,
+		m = text, img = img, iw = iw, ih = ih, t = stamp, r = r }, true)
+	-- three attempts with backoff instead of one bounce, so a
+	-- rate-limited moment doesn't eat the message
+	task.spawn(function()
+		for attempt = 1, 3 do
+			local ok, id = Net.post(payload)
+			if ok then
+				if id then
+					local e = Mem.byId[cid]
+					if e then
+						Mem.byId[cid] = nil
+						Mem.byId[id] = e
+						e.id = id
+					end
+					Net.sinceTab[Net.myShard] = id
+					Mem.save()
+				end
+				return
+			end
+			task.wait(attempt * 1.5)
+		end
+		H.flash("Send failed — check connection", UI.C.BADC)
+	end)
+end
+
+UI.send.MouseButton1Click:Connect(function() T.publish(UI.box.Text) end)
+UI.box.FocusLost:Connect(function(enter) if enter then T.publish(UI.box.Text) end end)
+
+-- ╔══════════════════════════════════════════════════════════╗
+-- ║  LOOPS                                                   ║
+-- ╚══════════════════════════════════════════════════════════╝
+-- presence heartbeat + prune at 3 missed beats. Fast beats are
+-- what make the count real time; the payload carries the name
+-- so the roster and the join notice have something to show.
+task.spawn(function()
+	while running and gui.Parent do
+		if Net.hostReady then Net.post({ sys = "hb", sid = Net.sid, u = plr.Name }) end
+		local now = os.clock()
+		local cutoff = now - Net.PRES_TTL
+		local n = 1
+		local me = Net.presence[Net.sid]
+		if me then me.at = now else Net.presence[Net.sid] = { at = now, name = plr.Name } end
+		for sid, rec in pairs(Net.presence) do
+			if sid ~= Net.sid then
+				if (rec.at or 0) < cutoff then Net.presence[sid] = nil else n = n + 1 end
+			end
+		end
+		if n ~= Net.presenceN then
+			Net.presenceN = n
+			H.presence()
+		end
+		task.wait(8)
+	end
+end)
+
+-- owner config re-announce, so late joiners inherit slow/blacklist
+task.spawn(function()
+	while running and gui.Parent do
+		if Cfg.me and Net.hostReady then Net.broadcast() end
+		task.wait(20)
+	end
+end)
+
+-- cursor poll: lanes that already hold a socket are skipped, so
+-- the poll is a backstop, not a second full transport
+task.spawn(function()
+	while running and gui.Parent do
+		if Net.hostReady then
+			for i = 1, Net.SHARDS do
+				if not running then break end
+				if not (Net.live and Net.socks[i]) then
+					local body = Link.pull(Net.shards[i], Net.sinceTab[i], 40)
+					if body then
+						for line in string.gmatch(body, "[^\n]+") do Net.enqueue(line) end
+					end
+					task.wait(0.2)
+				end
+			end
+		end
+		task.wait(Net.live and 8 or 2)
+	end
+end)
+
+-- decode queue: 25 lines per batch, then yield
+task.spawn(function()
+	while running and gui.Parent do
+		if Net.inboxN > 0 then
+			local n = 0
+			while Net.inboxN > 0 and n < 25 do
+				local line = table.remove(Net.inbox, 1)
+				Net.inboxN = Net.inboxN - 1
+				pcall(Net.handle, line)
+				n = n + 1
+			end
+			task.wait()
+		else
+			task.wait(0.05)
+		end
+	end
+end)
+
+-- watchdog: trust the socket's own flag first, and only recycle
+-- on a long silence (96s), because a quiet server is normal
+task.spawn(function()
+	local last, idle = {}, {}
+	while running and gui.Parent do
+		task.wait(8)
+		for i = 1, Net.SHARDS do
+			local s = Net.socks[i]
+			if s then
+				local dead = false
+				local okc, v = pcall(function() return s.Connected end)
+				if okc and v == false then dead = true end
+				if not dead then
+					local okc2, v2 = pcall(function() return s.IsOpen end)
+					if okc2 and v2 == false then dead = true end
+				end
+				local c = Net.sinceTab[i]
+				if last[i] == c then idle[i] = (idle[i] or 0) + 8 else last[i], idle[i] = c, 0 end
+				if dead or (idle[i] or 0) >= 96 then
+					idle[i] = 0
+					Net.closing[i] = nil
+					pcall(function() s:Close() end)
+					if Net.socks[i] == s then Net.socks[i] = nil end
+					Net.refresh()
+					task.delay(1, function()
+						if running and Net.hostReady then Net.startWS(i) end
+					end)
+				end
+			end
+		end
+	end
+end)
+
+-- pinned-host handshake loop: retries the same server with a
+-- widening gap until it takes a publish, then leaves the lanes
+-- to reconnect themselves. It never moves.
+Net.setLink("down")
+
+task.spawn(function()
+	task.wait(0.4)
+	while running and gui.Parent do
+		if not Net.hostReady or not Net.anySock() then
+			if Net.handshake() then
+				Net.hsFails = 0
+			else
+				Net.hsFails = (Net.hsFails or 0) + 1
+			end
+		else
+			Net.hsFails = 0
+		end
+		task.wait(math.min(20, 3 * 2 ^ math.min(Net.hsFails or 0, 3)))
+	end
+end)
+
+_G.NebulaChat = gui
+H.status()
+H.flash("Nebula Chat ready", UI.C.OKC)
